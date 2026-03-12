@@ -84,6 +84,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-wait", type=int, default=1500,
                    help="ms to wait for a fuller batch before dispatching (default 1500)")
 
+    # ID Service — Self-hosted Gemma 3 4B Remote Server
+    p.add_argument("--use-remote-gemma", action="store_true",
+                   help="Use self-hosted Gemma 3 4B on Colab/Kaggle instead of OpenRouter")
+    p.add_argument("--remote-gemma-url", default=None,
+                   help="URL of the remote Gemma server (e.g., https://xxx.ngrok.io). "
+                        "Can also be set via REMOTE_GEMMA_URL env var.")
+    p.add_argument("--remote-gemma-key", default=None,
+                   help="Optional API key for remote server authentication. "
+                        "Can also be set via REMOTE_GEMMA_KEY env var.")
+
     # UI
     p.add_argument("--show-velocity", action="store_true",
                    help="Show velocity indicator on bounding boxes")
@@ -144,15 +154,41 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
 
     # ── Imports (deferred to allow --help without torch) ─────────────────────
     from detector import Detector
-    from id_service import IdentificationService
     from stability import IoUVelocityStillnessDetector, OpticalFlowStillnessDetector
     from tracker import build_tracker
     from ui_overlay import UIOverlay
 
+    # ── Determine ID service backend ─────────────────────────────────────────
+    use_remote_gemma = args.use_remote_gemma
+    remote_gemma_url = args.remote_gemma_url or os.environ.get("REMOTE_GEMMA_URL", "")
+
+    if use_remote_gemma or remote_gemma_url:
+        from gemma_remote_service import GemmaRemoteService
+        id_backend_name = "Gemma 3 4B (self-hosted)"
+        id_service_class = GemmaRemoteService
+        id_service_kwargs = dict(
+            remote_url    = remote_gemma_url,
+            api_key       = args.remote_gemma_key or os.environ.get("REMOTE_GEMMA_KEY"),
+            cache_ttl     = args.id_ttl,
+            batch_size    = args.batch_size or 8,  # Higher default for remote
+            batch_wait_ms = args.batch_wait or 1000,
+        )
+    else:
+        from id_service import IdentificationService, NEMOTRON_MODEL
+        id_backend_name = "OpenRouter / Nemotron Nano 12B VL"
+        id_service_class = IdentificationService
+        id_service_kwargs = dict(
+            api_key       = args.openrouter_key,
+            model         = args.model or NEMOTRON_MODEL,
+            cache_ttl     = args.id_ttl,
+            batch_size    = args.batch_size,
+            batch_wait_ms = args.batch_wait,
+        )
+
     # ── Build components ─────────────────────────────────────────────────────
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("  VisionTracker starting")
-    print("  ID backend: OpenRouter / Nemotron Nano 12B VL (free)")
+    print(f"  ID backend: {id_backend_name}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
     detector = Detector(
@@ -179,14 +215,7 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
             iou_thresh=args.iou_thresh,
         )
 
-    from id_service import NEMOTRON_MODEL
-    id_service = IdentificationService(
-        api_key      = args.openrouter_key,
-        model        = args.model or NEMOTRON_MODEL,
-        cache_ttl    = args.id_ttl,
-        batch_size   = args.batch_size,
-        batch_wait_ms= args.batch_wait,
-    )
+    id_service = id_service_class(**id_service_kwargs)
 
     overlay = UIOverlay(
         show_velocity=args.show_velocity,
@@ -269,13 +298,19 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
 
             # ── Render ────────────────────────────────────────────────────
             fps = fps_counter.tick()
+            if use_remote_gemma or remote_gemma_url:
+                backend_str = f"gemma-remote | q:{id_service.queue_depth()}"
+                mode_str = "remote-gemma"
+            else:
+                backend_str = f"nemotron | q:{id_service.queue_depth()}"
+                mode_str = "openrouter"
             annotated = overlay.draw(
                 frame=display_frame,
                 tracked_objects=tracked,
                 progress_dict=id_service.progress,
                 fps=fps,
-                mode="openrouter",
-                backend=f"nemotron | q:{id_service.queue_depth()}",
+                mode=mode_str,
+                backend=backend_str,
                 velocities=velocities if args.show_velocity else None,
             )
 

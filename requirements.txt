@@ -20,11 +20,11 @@ supervision>=0.18.0        # ByteTrack wrapper (MIT)
 scipy>=1.11.0              # Hungarian algorithm for centroid tracker fallback
 
 # --- Identification: OpenRouter API ---
-requests>=2.31.0           # HTTP client for OpenRouter
+requests>=2.31.0           # HTTP client for OpenRouter and remote Gemma server
 urllib3>=2.0.0
 
 # --- Utilities ---
-python-dotenv>=1.0.0       # Optional: load OPENROUTER_API_KEY from .env file
+python-dotenv>=1.0.0       # Optional: load OPENROUTER_API_KEY or REMOTE_GEMMA_URL from .env file
 
 # --- Testing ---
 pytest>=7.4.0

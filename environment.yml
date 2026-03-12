@@ -1,0 +1,22 @@
+name: visiontracker
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.24
+  - scipy>=1.11
+  - pip:
+    - opencv-python>=4.8.0
+    - ultralytics>=8.0.200
+    - supervision>=0.18.0
+    - requests>=2.31.0
+    - urllib3>=2.0.0
+    - python-dotenv>=1.0.0
+    - pytest>=7.4.0
+    # PyTorch — install manually for your platform:
+    # CPU:   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    # CUDA:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+    # MPS:   pip install torch torchvision

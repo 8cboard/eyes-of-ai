@@ -166,12 +166,15 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
         from gemma_remote_service import GemmaRemoteService
         id_backend_name = "Gemma 3 4B (self-hosted)"
         id_service_class = GemmaRemoteService
+        # Use higher defaults for remote Gemma if not explicitly set
+        batch_size = args.batch_size if args.batch_size != 4 else 8  # 4 is OpenRouter default
+        batch_wait = args.batch_wait if args.batch_wait != 1500 else 1000  # 1500 is OpenRouter default
         id_service_kwargs = dict(
             remote_url    = remote_gemma_url,
             api_key       = args.remote_gemma_key or os.environ.get("REMOTE_GEMMA_KEY"),
             cache_ttl     = args.id_ttl,
-            batch_size    = args.batch_size or 8,  # Higher default for remote
-            batch_wait_ms = args.batch_wait or 1000,
+            batch_size    = batch_size,
+            batch_wait_ms = batch_wait,
         )
     else:
         from id_service import IdentificationService, NEMOTRON_MODEL

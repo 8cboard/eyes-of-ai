@@ -1,12 +1,24 @@
 # 🎯 VisionTracker — Real-Time Object Detection, Tracking & LLM Identification
 
-> **One-line quickstart:**
+> **One-line quickstart (OpenRouter):**
 > ```bash
 > bash install.sh && export OPENROUTER_API_KEY=sk-or-v1-... && python main.py
 > ```
+>
+> **One-line quickstart (Self-hosted Gemma):**
+> ```bash
+> bash install.sh && python main.py --use-remote-gemma --remote-gemma-url https://xxx.ngrok.io
+> ```
 
-Identification backend: **OpenRouter free tier** → `nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free`
-No credit card needed. Get a free API key at **https://openrouter.ai**
+**Two identification backends:**
+1. **OpenRouter (free tier)** → `nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free`
+   - No credit card needed. Get a key at **https://openrouter.ai**
+   - ~20 RPM rate limit, ~52 effective IDs/min with batching
+
+2. **Self-hosted Gemma 3 4B** (recommended for privacy)
+   - Run on Google Colab or Kaggle free tier
+   - No rate limits, your data stays private
+   - Setup: See `remote_server/README.md`
 
 ---
 
@@ -53,8 +65,8 @@ No credit card needed. Get a free API key at **https://openrouter.ai**
 | **Tracker** | `tracker.py` | `ByteTrackWrapper` (via `supervision`) is primary; `CentroidTracker` (pure-Python + scipy) is the fallback. Both expose the same `update(det)` API. |
 | **Stillness Detector** | `stability.py` | Per-track deques of centroid positions and IoU values. Fires identification only when velocity < threshold AND IoU > threshold for M consecutive frames. Also provides an optical-flow variant for moving cameras. |
 | **Cropper** | `main.py` | Slices the bbox region from the raw frame with padding, copies it for the background thread. |
-| **ID Service** | `id_service.py` | Single background dispatcher thread. Collects crops into batches (up to 4), acquires a token-bucket rate-limit token, fires one OpenRouter API call per batch. Writes results to a shared `progress` dict. |
-| **Cache** | `id_service.py` | Per-track TTL cache (`IdentificationCache`). Prevents re-identification until the TTL expires. |
+| **ID Service** | `id_service.py` / `gemma_remote_service.py` | Single background dispatcher thread. Collects crops into batches, fires API calls (OpenRouter or remote Gemma server). Writes results to a shared `progress` dict. |
+| **Cache** | `id_service.py` / `gemma_remote_service.py` | Per-track TTL cache (`IdentificationCache`). Prevents re-identification until the TTL expires. |
 | **UI Overlay** | `ui_overlay.py` | Draws coloured bounding boxes, label blocks, progress bars, status dots, and a HUD bar. Reads from the shared progress dict — never blocks. |
 
 ---
@@ -120,14 +132,60 @@ conda activate visiontracker
 
 ---
 
+## Self-Hosted Gemma 3 4B (Privacy-First Option)
+
+For fully private identification without sending images to third-party APIs:
+
+### Quick Setup
+
+1. **Open the Colab notebook** (recommended for beginners):
+   ```
+   remote_server/colab_setup.ipynb
+   ```
+   - Upload to Google Colab
+   - Runtime → GPU (T4)
+   - Follow the 6 cells to start server
+   - Copy the **Public URL** from output
+
+2. **Or use Kaggle** (more GPU RAM):
+   ```
+   remote_server/kaggle_setup.ipynb
+   ```
+   - Upload to Kaggle
+   - Settings → Accelerator → GPU, Internet → On
+   - Add ngrok token to Secrets
+   - Run all cells
+
+3. **Run VisionTracker with your server**:
+   ```bash
+   python main.py --use-remote-gemma --remote-gemma-url https://xxx.ngrok.io
+   ```
+
+### Why Self-Host?
+
+| Feature | OpenRouter Free | Self-Hosted Gemma |
+|---------|-----------------|-------------------|
+| **Rate Limit** | ~20 RPM | Unlimited |
+| **Privacy** | Sends images to third-party | Your server, your data |
+| **Cost** | Free | Free (Colab/Kaggle tier) |
+| **Latency** | 5-15s per batch | 1-3s after warmup |
+| **Setup** | API key only | ~5 minute setup |
+
+See `remote_server/README.md` for detailed setup instructions.
+
+---
+
 ## Running
 
 ```bash
-# Standard (reads key from env var)
+# Standard with OpenRouter (reads key from env var)
 python main.py
 
-# Pass key directly
+# Pass OpenRouter key directly
 python main.py --openrouter-key sk-or-v1-...
+
+# Use self-hosted Gemma instead
+python main.py --use-remote-gemma --remote-gemma-url https://xxx.ngrok.io
 
 # Faster on CPU: skip every other frame, small detector
 python main.py --skip-frames 3 --detector yolov8n.pt --width 640 --height 360
@@ -146,9 +204,21 @@ python single_file_demo.py --openrouter-key sk-or-v1-...
 
 ## Key Flags
 
+### OpenRouter (Default)
 ```
 --openrouter-key KEY   OpenRouter API key (also: OPENROUTER_API_KEY env var)
 --model SLUG           Override model slug (default: nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free)
+```
+
+### Self-Hosted Gemma (Privacy)
+```
+--use-remote-gemma          Use self-hosted Gemma instead of OpenRouter
+--remote-gemma-url URL      Server URL (also: REMOTE_GEMMA_URL env var)
+--remote-gemma-key KEY      Optional API key (also: REMOTE_GEMMA_KEY env var)
+```
+
+### Camera & Detection
+```
 --input 0              Camera index (0) or path to video file
 --width 1280           Capture width
 --height 720           Capture height
@@ -157,11 +227,19 @@ python single_file_demo.py --openrouter-key sk-or-v1-...
 --conf 0.35            Detection confidence threshold
 --imgsz 640            Detector input resolution (320/640/1280)
 --tracker bytetrack    Tracker: bytetrack or centroid
+```
+
+### Stillness & Identification
+```
 --still-frames 10      M: consecutive below-threshold frames to trigger ID
 --still-window 15      N: history window for stillness
 --id-ttl 45            Cache TTL in seconds
---batch-size 4         Max crops per API call (1–4)
+--batch-size 4         Max crops per API call (1–4 for OpenRouter, 1–16 for remote)
 --batch-wait 1500      ms to wait for a fuller batch
+```
+
+### System
+```
 --device cpu/cuda/mps  Compute device (default: auto)
 --grayscale            Force grayscale (faster on slow CPUs)
 --optical-flow         Use optical-flow stillness (for moving cameras)
@@ -207,11 +285,21 @@ python main.py --skip-frames 2 --width 1280 --height 720 --tracker bytetrack
 
 ## Privacy & Security
 
+### OpenRouter Backend
 > **Crops are sent over the internet to OpenRouter servers.**
 > - OpenRouter may log requests per their [Privacy Policy](https://openrouter.ai/privacy)
 > - Do **not** use with sensitive footage (faces, private spaces, etc.)
 > - The `:free` model tier is rate-limited; verify current terms at openrouter.ai
-> - For fully offline identification, replace `id_service.py` with a local Ollama/LLaVA backend
+
+### Self-Hosted Gemma Backend (Private)
+> **Crops are sent to YOUR server on Colab/Kaggle via HTTPS.**
+> - Images never touch third-party APIs
+> - Your data stays within your control
+> - ngrok tunnels are encrypted end-to-end
+> - Add API key for additional security: `--remote-gemma-key`
+
+### Fully Offline Option
+For 100% offline operation, replace `id_service.py` with a local Ollama/LLaVA backend running on the same machine.
 
 ---
 
@@ -230,15 +318,23 @@ vision_tracker/
 ├── requirements.txt
 ├── environment.yml
 ├── install.sh
-├── .env.example          ← copy to .env and fill in your key
-├── main.py               ← entry point (modular)
-├── detector.py           ← YOLOv8 wrapper + frame-skip
-├── tracker.py            ← ByteTrack + centroid fallback
-├── stability.py          ← stillness policy + optical flow
-├── id_service.py         ← OpenRouter batched ID + rate limiter + cache
-├── ui_overlay.py         ← OpenCV drawing + progress bars
-├── single_file_demo.py   ← all-in-one self-contained runnable
+├── .env.example              ← copy to .env and fill in your key
+├── main.py                   ← entry point (modular, supports both backends)
+├── detector.py               ← YOLOv8 wrapper + frame-skip
+├── tracker.py                ← ByteTrack + centroid fallback
+├── stability.py              ← stillness policy + optical flow
+├── id_service.py             ← OpenRouter batched ID + rate limiter + cache
+├── gemma_remote_service.py   ← Self-hosted Gemma 3 4B HTTP client
+├── ui_overlay.py             ← OpenCV drawing + progress bars
+├── single_file_demo.py       ← all-in-one self-contained runnable
+├── remote_server/            ← Colab/Kaggle server setup
+│   ├── README.md
+│   ├── requirements.txt
+│   ├── colab_setup.ipynb     ← Google Colab notebook
+│   └── kaggle_setup.ipynb    ← Kaggle notebook
 └── tests/
     ├── __init__.py
-    └── test_smoke.py     ← smoke tests (no network, no webcam required)
+    ├── conftest.py           ← Shared pytest fixtures
+    ├── test_smoke.py         ← Smoke tests (no network, no webcam required)
+    └── test_gemma_remote.py  ← Tests for remote Gemma service
 ```

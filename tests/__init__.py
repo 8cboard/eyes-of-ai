@@ -1,0 +1,3 @@
+"""
+VisionTracker tests package.
+"""

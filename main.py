@@ -190,23 +190,26 @@ def draw_annotated_frame(
         status = prog.get("status", "idle")
         label = prog.get("label")
 
-        # Build label text
-        header = f"#{obj.track_id}"
+        # Build label text - show only object name, no track ID
         if status == "done" and label:
-            id_line = label[:40]
+            display_text = label[:40]
         elif status == "identifying":
-            id_line = "Identifying..."
+            display_text = "..."
         elif status == "queued":
-            id_line = "Queued..."
+            display_text = "..."
         elif status == "error":
-            id_line = "Error"
+            display_text = "?"
         else:
-            id_line = None
+            display_text = None
 
-        # Draw label background
-        lines = [header]
-        if id_line:
-            lines.append(id_line)
+        # Draw label background - only if we have text to display
+        lines = []
+        if display_text:
+            lines.append(display_text)
+
+        # Skip drawing label if no text
+        if not lines:
+            continue
 
         pad = 4
         line_height = 18

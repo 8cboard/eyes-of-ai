@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # install.sh — VisionTracker install script
-# Works on: Ubuntu/Debian, macOS (Homebrew), or any system with pip
+# Installs all dependencies for the client (main.py) on Linux or macOS.
+# For the remote server see: remote_server/README.md
 set -euo pipefail
 
 echo "============================================"
 echo "  VisionTracker — Install Script"
-echo "  Backend: OpenRouter / Nemotron Nano 12B VL"
 echo "============================================"
 echo ""
 
@@ -34,7 +34,7 @@ echo ""
 echo "[2/3] Installing Python packages..."
 pip install --upgrade pip wheel setuptools
 
-# Detect GPU and install appropriate torch
+# Detect GPU for torch
 if python3 -c "import subprocess; r=subprocess.run(['nvidia-smi'],capture_output=True); exit(0 if r.returncode==0 else 1)" 2>/dev/null; then
     echo "  → NVIDIA GPU detected. Installing torch with CUDA 12.1..."
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
@@ -48,26 +48,25 @@ fi
 
 pip install -r requirements.txt
 
-# ── 3. Pre-download YOLOv8n weights ──────────────────────────────────────────
+# ── 3. Verify ─────────────────────────────────────────────────────────────────
 echo ""
-echo "[3/3] Pre-downloading YOLOv8n weights (~6 MB)..."
+echo "[3/3] Verifying installation..."
 python3 -c "
-from ultralytics import YOLO
-model = YOLO('yolov8n.pt')
-print('  ✓ YOLOv8n ready')
+import cv2, numpy, supervision, scipy
+print('  ✓ opencv   ', cv2.__version__)
+print('  ✓ numpy    ', numpy.__version__)
+print('  ✓ supervision loaded')
+print('  ✓ scipy loaded')
 "
 
 echo ""
 echo "============================================"
-echo "  Installation complete!"
+echo "  Client installation complete!"
 echo ""
-echo "  Set your free OpenRouter API key:"
-echo "    export OPENROUTER_API_KEY=sk-or-v1-..."
-echo "  Get a free key at: https://openrouter.ai"
-echo "  (no credit card needed for :free models)"
-echo ""
-echo "  Run:"
+echo "  To run without identification (camera-only):"
 echo "    python main.py"
-echo "  or:"
-echo "    python single_file_demo.py"
+echo ""
+echo "  To run with remote LLM identification:"
+echo "    1. Set up the remote server (see remote_server/README.md)"
+echo "    2. python main.py --remote-url https://your-server.ngrok.io"
 echo "============================================"

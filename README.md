@@ -1,254 +1,202 @@
 # VisionTracker — Real-Time Edge Detection, Tracking & LLM Identification
 
-VisionTracker is a real-time computer vision pipeline that detects objects via edge/contour detection, tracks them across frames, and uses a remote LLM to identify objects by their colored bounding boxes.
+VisionTracker detects objects via edge/contour detection, tracks them across frames,
+and uses a self-hosted remote VLM to identify what each object is.
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         VisionTracker Pipeline                               │
-│                                                                              │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌─────────────────────┐    │
-│  │  Camera  │───▶│  Edge    │───▶│ Tracker  │───▶│  Draw Colored       │    │
-│  │ Capture  │    │ Detector │    │(ByteTrack│    │  Bounding Boxes     │    │
-│  │ 720p/30  │    │(Canny + │    │ /centroid│    │  (visual IDs)       │    │
-│  │ frames   │    │contours) │    │ fallback)│    └─────────┬───────────┘    │
-│  └──────────┘    └──────────┘    └──────────┘              │                │
-│                                                            ▼                │
-│  ┌──────────┐    ┌──────────┐                   ┌─────────────────────┐    │
-│  │  Cache   │◀───│ Remote   │◀──────────────────│  ID Service         │    │
-│  │(per-track│    │ LLM      │                   │                     │    │
-│  │ TTL dict)│    │ Server   │                   │ Priority Queue      │    │
-│  └──────────┘    │(GGUF/    │                   │ Batch Dispatcher    │    │
-│        │         │Safeten.) │                   │   ↓                 │    │
-│        │         └──────────┘                   │ HTTP POST           │    │
-│        │                                         │ Annotated Frame     │    │
-│        │                                         └────────┬────────────┘    │
-│        │              Background Thread (non-blocking)    │                │
-│        ▼                                                   ▼                │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                        UI Overlay (OpenCV)                          │   │
-│  │   [Colored Box] [Label / "Identifying… 42%"] [FPS]                 │   │
-│  │   [████░░░░] progress bar   ● green=done   ● orange=in-progress    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────────────┘
+Camera → EdgeDetector → Tracker → per-object: draw single box → IDService (bg thread)
+                                                                      ↓
+                                                          Remote LLM /identify
+                                                                      ↓
+                                                              UIOverlay (OpenCV)
 ```
 
-## Key Features
+---
 
-- **Edge/Contour Detection**: Canny edge detection finds objects without requiring YOLO or training data
-- **Multi-Object Tracking**: ByteTrack (via supervision) with CentroidTracker fallback
-- **Visual Identification**: Objects are identified by colored bounding boxes sent to LLM
-- **Remote LLM Support**: Supports both GGUF (llama-cpp-python) and Safetensors (transformers) models
-- **Optional Background Removal**: Use `rembg` to remove backgrounds before edge detection
-- **Windows Support**: PowerShell install script included
+## Quick Start
 
-## Installation
+### 1 — Install client dependencies
 
-### Linux/macOS
 ```bash
 bash install.sh
 ```
 
-### Windows
-```powershell
-.\install.ps1
-```
+### 2 — Start the remote server (Kaggle P100 recommended)
 
-### Manual
-```bash
-pip install -r requirements.txt
-```
+Open `remote_server/kaggle_setup.ipynb` and run all cells.
+It will print a URL like `https://abc123.ngrok.io`.
 
-## Remote LLM Server Setup
-
-The remote server supports both GGUF and Safetensors vision-language models under 10GB.
-
-### Quick Start with GGUF (Recommended for Colab)
-
-1. **Download a vision-capable GGUF model** (e.g., Gemma 3 4B IT):
-   ```bash
-   wget https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf
-   ```
-
-2. **Start the server**:
-   ```bash
-   cd remote_server
-   pip install -r requirements.txt
-   python server.py --model-path /path/to/gemma-3-4b-it-Q4_K_M.gguf
-   ```
-
-3. **For public access** (use ngrok or cloudflared):
-   ```bash
-   ngrok http 8000
-   ```
-
-### Using Safetensors Models
+### 3 — Run
 
 ```bash
-python server.py --model-path /path/to/safetensors-model-dir
+# With identification
+python main.py --remote-url https://abc123.ngrok.io
+
+# Camera-only (no identification)
+python main.py
+
+# Video file
+python main.py --input video.mp4 --remote-url https://abc123.ngrok.io
 ```
 
-Supported models include:
-- microsoft/Phi-4-multimodal-instruct
-- meta-llama/Llama-3.2-11B-Vision-Instruct
-- google/gemma-3-4b-it (via transformers)
+---
 
-### Server API Endpoints
+## Remote Server — Model
+
+**LLaVA-1.6-Mistral-7B** (recommended — best quality under 10 GB, most stable GGUF)
+
+| File | Size | Source |
+|------|------|--------|
+| `llava-1.6-mistral-7b.Q4_K_M.gguf` | ~4.4 GB | [cjpais/llava-1.6-mistral-7b-gguf](https://huggingface.co/cjpais/llava-1.6-mistral-7b-gguf) |
+| `mmproj-model-f16.gguf` | ~631 MB | same repo |
+
+> ⚠️ **The mmproj (vision encoder) file is required.** Without it the model is
+> text-only and cannot see images. Pass `--mmproj-path` when starting the server.
+
+### Install llama-cpp-python (CUDA 12.1 prebuilt wheels)
+
+```bash
+# DO NOT use plain pip install — it compiles CPU-only from source
+pip install llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+# Other CUDA versions: cu122  cu124  cu125  cpu (slow)
+# Full list: https://abetlen.github.io/llama-cpp-python/whl/
+```
+
+### Start the server
+
+```bash
+cd remote_server
+python server.py \
+    --model-path  /path/to/llava-1.6-mistral-7b.Q4_K_M.gguf \
+    --mmproj-path /path/to/mmproj-model-f16.gguf
+```
+
+### API
 
 ```
-GET /health
-Response: {"status": "healthy", "model": "...", "type": "gguf|safetensors"}
+GET  /health   → {"status":"healthy","model":"...","type":"gguf","version":"3.0.0"}
 
 POST /identify
-Request: {
-  "annotated_image": "base64_jpeg",
-  "color_map": {"red": 1, "blue": 2, "green": 3}
-}
-Response: {
-  "results": [
-    {"track_id": 1, "description": "person"},
-    {"track_id": 2, "description": "car"}
-  ]
-}
+Body:   {"annotated_image": "<base64 JPEG>"}
+Return: {"result": "person"}   ← single common noun
 ```
 
-## Running VisionTracker
+---
 
-### Basic usage
+## Edge Detection — How It Works
+
+The pipeline is designed for **indoor scenes** (desk, room, people):
+
+1. **Bilateral filter** — smooths fabric/wood texture noise while keeping hard edges
+2. **Adaptive Canny** — thresholds auto-calibrate to the scene's brightness (no hand-tuning)
+3. **Morphological close** — bridges gaps *inside* object outlines so each object becomes one filled shape
+4. **Proximity merge** — bounding boxes within N px of each other are unioned (fixes fragmentation)
+5. **Aspect-ratio filter** — drops thin-line noise (wires, shadows, furniture edges)
+
+### Key flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--merge-distance 30` | 30 px | Increase for cluttered desks; decrease for well-separated objects |
+| `--close-kernel 15` | 15 px | Larger = bridges bigger outline gaps (try 20–25 for clothing) |
+| `--edge-min-area 500` | 500 px² | Raise to ignore small objects (phones, cups) |
+| `--no-auto-canny` | off | Use `--canny-low/--canny-high` manually instead of auto |
+| `--skip-frames 2` | 1 | Run detector every 2nd frame for better FPS |
+
+### Indoor tuning presets
+
 ```bash
-python main.py --remote-url https://your-server.ngrok.io
+# Fine desk objects (small objects, close together)
+python main.py --merge-distance 20 --edge-min-area 300 --close-kernel 10
+
+# Room-scale scene (people, furniture)
+python main.py --merge-distance 40 --edge-min-area 1000 --close-kernel 20
+
+# Fast mode (CPU)
+python main.py --skip-frames 2 --tracker centroid --merge-distance 30
 ```
 
-### With video file
-```bash
-python main.py --input test_video.mp4 --remote-url https://your-server.ngrok.io
+---
+
+## All Flags
+
+### Input
+```
+--input 0              Camera index or video file path
+--width 1280           Capture width
+--height 720           Capture height
+--grayscale            Force grayscale
 ```
 
-### With background removal
-```bash
-python main.py --remote-url https://your-server.ngrok.io --use-bg-removal
+### Edge Detector
+```
+--edge-min-area 500    Minimum contour area (px²)
+--edge-max-area 100000 Maximum contour area
+--merge-distance 30    Proximity merge radius (px); 0 = disabled
+--close-kernel 15      Morphological close kernel size
+--no-auto-canny        Disable adaptive thresholds
+--canny-low 50         Manual Canny low (--no-auto-canny)
+--canny-high 150       Manual Canny high (--no-auto-canny)
+--use-bg-removal       rembg background removal (slow but cleaner edges)
+--skip-frames 1        Detect every N frames
 ```
 
-### CPU-optimized settings
-```bash
-python main.py --remote-url https://your-server.ngrok.io \
-  --skip-frames 2 \
-  --edge-min-area 1000 \
-  --tracker centroid
+### Tracker
 ```
-
-## Key Flags
-
-### Camera & Detection
-```
---input 0                 Camera index or video file path
---width 1280              Capture width
---height 720              Capture height
---edge-min-area 500       Minimum contour area (pixels)
---edge-max-area 100000    Maximum contour area (pixels)
---canny-low 50            Canny lower threshold
---canny-high 150          Canny upper threshold
---use-bg-removal          Enable background removal
---skip-frames 1           Run detector every N frames
-```
-
-### Tracking
-```
---tracker bytetrack       Tracker type: bytetrack or centroid
+--tracker bytetrack    bytetrack (default) or centroid
 ```
 
 ### Identification
 ```
---remote-url URL          Remote LLM server URL
---remote-key KEY          API key for server (optional)
---id-ttl 45               Cache TTL in seconds
---id-interval 5           Seconds between ID attempts per track
---batch-size 8            Max tracks per API call
---batch-wait 1000         ms to wait for fuller batch
+--remote-url URL       Remote server URL (omit to run without identification)
+--remote-key KEY       Optional bearer token
+--id-ttl 45            Cache TTL in seconds
+--id-interval 5        Seconds between re-identification per track
 ```
 
-### System
+### UI
 ```
---grayscale               Force grayscale processing
---no-display              Headless mode
-```
-
-## How It Works
-
-1. **Edge Detection**: The frame is processed with Canny edge detection and contours are found
-2. **Tracking**: Contours are tracked across frames using ByteTrack or CentroidTracker
-3. **Colored Boxes**: Each tracked object gets a unique colored bounding box (20 colors cycle)
-4. **LLM Identification**: The annotated frame with colored boxes is sent to the remote LLM
-5. **Response Parsing**: The LLM returns single common nouns for each colored box (e.g., "person", "car")
-6. **UI Display**: Results are shown on-screen with colored boxes and labels
-
-## LLM Prompt Engineering
-
-The remote server sends prompts engineered for single common noun responses:
-
-```
-You see N colored boxes on objects in an image.
-The colors and their object numbers are: red (object #1), blue (object #2), ...
-
-Identify each object with exactly ONE common noun.
-Use simple everyday words like: person, car, dog, chair, table, etc.
-
-Respond in this exact format (one per line):
-1. [common noun for the red box]
-2. [common noun for the blue box]
-...
+--show-velocity        Show velocity indicator
+--no-display           Headless mode (no window)
 ```
 
-## File Layout
+---
 
-```
-visiontracker/
-├── README.md
-├── requirements.txt
-├── install.sh              # Linux/macOS install
-├── install.ps1             # Windows install
-├── main.py                 # Entry point
-├── edge_detector.py        # Edge/contour detection
-├── tracker.py              # ByteTrack + CentroidTracker
-├── id_service.py           # Remote LLM client
-├── ui_overlay.py           # OpenCV visualization
-├── remote_server/          # Remote LLM server
-│   ├── server.py           # FastAPI server (GGUF + Safetensors)
-│   ├── requirements.txt
-│   ├── colab_setup.ipynb   # Google Colab notebook
-│   └── kaggle_setup.ipynb  # Kaggle notebook
-└── tests/
-    ├── test_smoke.py
-    └── conftest.py
+## Performance
+
+| Config | Expected FPS |
+|--------|-------------|
+| CPU, ByteTrack, skip=1 | 20–30 |
+| CPU, Centroid, skip=2 | 30–45 |
+| With bg removal | 10–15 |
+
+---
+
+## Tests
+
+```bash
+pytest tests/ -v
 ```
 
-## Performance Tips
+All tests run offline with synthetic frames — no GPU, webcam, or internet needed.
 
-| Configuration | Expected FPS | Notes |
-|--------------|--------------|-------|
-| CPU, ByteTrack, skip=1 | 20-30 FPS | Modern CPU |
-| CPU, Centroid, skip=2 | 30-45 FPS | Lightweight tracker |
-| With background removal | 10-15 FPS | rembg is slower |
-
-- Higher `edge-min-area` = fewer contours = faster
-- `skip-frames` trades detection frequency for FPS
-- Identification runs in background — doesn't affect FPS
+---
 
 ## Privacy
 
-- Video frames are sent to your **self-hosted** remote LLM server
-- No third-party APIs (no OpenRouter, no cloud services)
-- Use HTTPS/ngrok for encrypted transport
-- Add `--remote-key` for additional authentication
+- Frames are sent only to **your own** self-hosted server
+- No third-party cloud APIs
+- Use HTTPS (ngrok/cloudflared) for encrypted transport
+- Add `--remote-key` for bearer-token auth
 
-## Requirements
-
-- Python 3.10+
-- OpenCV with GUI support
-- 4GB+ RAM
-- For remote server: GPU optional but recommended (T4, P100, or better)
+---
 
 ## License
 
-MIT License
+MIT

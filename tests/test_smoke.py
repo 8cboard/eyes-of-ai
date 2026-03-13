@@ -216,15 +216,16 @@ class TestIDService:
         assert a < b  # lower priority = served first
 
     def test_service_raises_without_url(self):
-        """IdentificationService warns if no URL provided."""
+        """IdentificationService raises ValueError if no URL provided."""
         from id_service import IdentificationService
         import os
+        import pytest
         # Temporarily clear env var
         orig = os.environ.pop("REMOTE_URL", None)
         try:
-            # Should create service but warn
-            svc = IdentificationService(remote_url="", cache_ttl=10)
-            svc.shutdown()
+            # Should raise ValueError
+            with pytest.raises(ValueError, match="Remote server URL"):
+                IdentificationService(remote_url="", cache_ttl=10)
         finally:
             if orig is not None:
                 os.environ["REMOTE_URL"] = orig

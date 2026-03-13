@@ -2,7 +2,7 @@
 tracker.py — Multi-object tracker for VisionTracker.
 
 Two implementations:
-  1. ByteTrackWrapper  — wraps supervision.ByteTracker (recommended).
+  1. ByteTrackWrapper  — wraps supervision.ByteTrack (recommended).
      ByteTrack is a high-performance tracker from the paper
      "ByteTrack: Multi-Object Tracking by Associating Every Detection Box"
      (Zhang et al., 2022).  The ``supervision`` library ships a CPU-friendly
@@ -117,13 +117,11 @@ class Tracker(ABC):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ByteTrackWrapper(Tracker):
-    """Wraps supervision.ByteTracker.
+    """Wraps supervision.ByteTrack.
 
     ByteTrack uses two confidence thresholds:
       - high-conf detections → immediate track association
       - low-conf detections  → used to rescue "lost" tracks
-
-    Handles supervision API differences across versions (0.18 – 0.25+).
 
     Parameters
     ----------
@@ -148,9 +146,8 @@ class ByteTrackWrapper(Tracker):
             raise ImportError(
                 "supervision is required for ByteTrack: pip install supervision"
             )
-        # supervision changed its ByteTracker constructor across versions.
-        # Try the current API first, fall back to older positional-style.
-        self._tracker = _build_sv_bytetracker(
+        # New supervision (0.25+) uses ByteTrack with different API
+        self._tracker = sv.ByteTrack(
             track_activation_threshold=track_activation_threshold,
             lost_track_buffer=lost_track_buffer,
             minimum_matching_threshold=minimum_matching_threshold,
@@ -202,49 +199,6 @@ class ByteTrackWrapper(Tracker):
                 confidence=float(tracked.confidence[i]) if tracked.confidence is not None else 0.0,
             ))
         return objects
-
-
-def _build_sv_bytetracker(
-    track_activation_threshold: float,
-    lost_track_buffer: int,
-    minimum_matching_threshold: float,
-    frame_rate: int,
-):
-    """Instantiate sv.ByteTracker handling API differences across supervision versions."""
-    import inspect
-    sig = inspect.signature(sv.ByteTracker.__init__)
-    params = set(sig.parameters.keys())
-
-    # supervision >= 0.22: constructor signature changed
-    if "track_high_thresh" in params:
-        return sv.ByteTracker(
-            track_high_thresh=track_activation_threshold,
-            track_low_thresh=0.1,
-            new_track_thresh=track_activation_threshold,
-            track_buffer=lost_track_buffer,
-            match_thresh=minimum_matching_threshold,
-            frame_rate=frame_rate,
-        )
-    # supervision 0.18 – 0.21 (keyword args)
-    elif "track_activation_threshold" in params:
-        return sv.ByteTracker(
-            track_activation_threshold=track_activation_threshold,
-            lost_track_buffer=lost_track_buffer,
-            minimum_matching_threshold=minimum_matching_threshold,
-            frame_rate=frame_rate,
-        )
-    else:
-        # Oldest API — positional
-        try:
-            return sv.ByteTracker(
-                track_activation_threshold,
-                lost_track_buffer,
-                minimum_matching_threshold,
-                frame_rate,
-            )
-        except TypeError:
-            # Last resort: no-arg constructor
-            return sv.ByteTracker()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

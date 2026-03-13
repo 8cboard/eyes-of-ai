@@ -1,27 +1,23 @@
 """
-id_service.py — Remote LLM Identification Service (Annotated Frame Mode)
+id_service.py — Remote LLM Identification Service (Single Object Mode)
 
-Sends full annotated frames (not crops) to a remote LLM server for identification.
-The LLM receives a frame with colored bounding boxes and returns a single common
-noun describing each object based on its color.
+Sends full frames with a SINGLE bounding box drawn to a remote LLM server for 
+identification. Each tracked object gets its own request with the box drawn on 
+a copy of the full frame.
 
 Architecture:
-  - Local: Edge detection → Tracking → Draw colored boxes → Send annotated frame
-  - Remote: LLM identifies objects by color → Returns {track_id: noun}
+  - Local: Edge detection → Tracking → For each object: Draw single box → Send frame
+  - Remote: LLM identifies the single boxed object → Returns single common noun
 
 API Endpoint (remote server):
   POST /identify
   {
-    "annotated_image": "base64_jpeg",
-    "color_map": {"red": 1, "blue": 2, "green": 3, ...}
+    "annotated_image": "base64_jpeg"
   }
   
   Response:
   {
-    "results": [
-      {"track_id": 1, "description": "person"},
-      {"track_id": 2, "description": "car"}
-    ]
+    "result": "person"  // single common noun
   }
 
 Prompt engineering ensures single common noun responses (person, car, dog, chair, etc.)
@@ -53,8 +49,6 @@ log = logging.getLogger("id_service")
 
 # Configuration constants
 DEFAULT_REMOTE_URL = ""
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_BATCH_WAIT_MS = 1_000
 REQUEST_TIMEOUT_S = 60
 MAX_RETRIES = 3
 RETRY_BASE_DELAY_S = 2.0
@@ -64,53 +58,11 @@ JPEG_QUALITY = 85
 MAX_FRAME_SIZE = 1280  # Longest edge for annotated frame
 
 
-# Color palette must match ui_overlay.py exactly
-_COLOR_NAMES = [
-    "sky blue", "orange", "green", "pink", "blue", "vermillion",
-    "yellow", "teal", "red", "purple", "peach", "mint",
-    "lime", "light blue", "magenta", "light yellow", "cyan",
-    "olive", "dark cyan", "dark magenta"
-]
-
-_PALETTE = [
-    (86, 180, 233),   # sky blue
-    (230, 159, 0),    # orange
-    (0, 158, 115),    # green
-    (204, 121, 167),  # pink
-    (0, 114, 178),    # blue
-    (213, 94, 0),     # vermillion
-    (240, 228, 66),   # yellow
-    (0, 204, 153),    # teal
-    (255, 102, 102),  # red
-    (153, 102, 255),  # purple
-    (255, 178, 102),  # peach
-    (102, 255, 178),  # mint
-    (178, 255, 102),  # lime
-    (102, 178, 255),  # light blue
-    (255, 102, 178),  # magenta
-    (255, 255, 102),  # light yellow
-    (102, 255, 255),  # cyan
-    (204, 204, 0),    # olive
-    (0, 204, 204),    # dark cyan
-    (204, 0, 204),    # dark magenta
-]
-
-
-def _color_name(track_id: int) -> str:
-    """Get the color name for a track_id (matches UI palette)."""
-    return _COLOR_NAMES[track_id % len(_COLOR_NAMES)]
-
-
-def _color_bgr(track_id: int) -> tuple[int, int, int]:
-    """Get the BGR color tuple for a track_id (matches UI palette)."""
-    return _PALETTE[track_id % len(_PALETTE)]
-
-
 @dataclass(order=True)
 class PendingItem:
-    """One frame awaiting identification."""
+    """One frame with single box awaiting identification."""
     priority:     float       = field()
-    track_ids:    list[int]   = field(compare=False)
+    track_id:     int         = field(compare=False)
     frame:        np.ndarray  = field(compare=False)
     submitted_at: float       = field(compare=False, default_factory=time.monotonic)
 
@@ -214,31 +166,27 @@ class RemoteLLMClient:
     def identify_frame(
         self,
         frame: np.ndarray,
-        track_ids: list[int]
-    ) -> dict[int, str]:
-        """Identify objects in an annotated frame.
+        track_id: int
+    ) -> str:
+        """Identify the single object in an annotated frame.
 
         Parameters
         ----------
         frame : np.ndarray
-            Annotated frame with colored bounding boxes
-        track_ids : list[int]
-            List of track IDs present in the frame
+            Frame with single bounding box drawn
+        track_id : int
+            Track ID of the object in the box
 
         Returns
         -------
-        dict[int, str]
-            {track_id: description_string} for each track
+        str
+            Single common noun describing the object
         """
         # Encode frame to base64 JPEG
         img_b64 = _encode_frame(frame)
 
-        # Build color map
-        color_map = {_color_name(tid): tid for tid in track_ids}
-
         payload = {
             "annotated_image": img_b64,
-            "color_map": color_map,
         }
 
         last_exception: Optional[Exception] = None
@@ -254,19 +202,13 @@ class RemoteLLMClient:
                 resp.raise_for_status()
 
                 data = resp.json()
-                results = {}
-                for result in data.get("results", []):
-                    tid = result.get("track_id")
-                    desc = result.get("description", "")
-                    if tid is not None:
-                        results[tid] = desc
+                result = data.get("result", "object")
 
-                # Fill in any missing results with "object"
-                for tid in track_ids:
-                    if tid not in results:
-                        results[tid] = "object"
+                # Validate: should be a single common noun
+                if not result or not isinstance(result, str):
+                    result = "object"
 
-                return results
+                return result.strip().lower()
 
             except _req.exceptions.RequestException as exc:
                 last_exception = exc
@@ -281,11 +223,11 @@ class RemoteLLMClient:
 
 
 class IdentificationService:
-    """Non-blocking identification using remote LLM with annotated frames.
+    """Non-blocking identification using remote LLM with single-box frames.
 
     One background thread owns all HTTP traffic.
-    The main thread calls ``submit()`` with an annotated frame.
-    The dispatcher sends frames to the remote LLM server.
+    The main thread calls ``submit()`` with a frame containing a single box.
+    The dispatcher sends individual frames to the remote LLM server.
 
     Parameters
     ----------
@@ -295,10 +237,6 @@ class IdentificationService:
         Optional API key for server authentication
     cache_ttl : float
         Seconds a cached result stays valid.
-    batch_size : int
-        Max track IDs per API call.
-    batch_wait_ms : int
-        How long (ms) the dispatcher waits for a fuller batch.
     """
 
     def __init__(
@@ -306,16 +244,13 @@ class IdentificationService:
         remote_url: str = "",
         api_key: Optional[str] = None,
         cache_ttl: float = 45.0,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        batch_wait_ms: int = DEFAULT_BATCH_WAIT_MS,
+        **kwargs,  # Accept but ignore batch_size, batch_wait_ms for compatibility
     ) -> None:
         remote_url = remote_url or os.environ.get("REMOTE_URL", "")
         api_key = api_key or os.environ.get("REMOTE_API_KEY")
 
         self._client = RemoteLLMClient(base_url=remote_url, api_key=api_key)
         self._cache = IdentificationCache(ttl_seconds=cache_ttl)
-        self._batch_sz = max(1, min(batch_size, 16))
-        self._batch_wait = batch_wait_ms / 1_000.0
 
         # Shared progress dict
         self.progress: dict[int, dict] = {}
@@ -338,9 +273,8 @@ class IdentificationService:
         )
         self._thread.start()
 
-        print(f"[IDService] Remote LLM identification")
+        print(f"[IDService] Remote LLM identification (single object mode)")
         print(f"[IDService] Server: {remote_url}")
-        print(f"[IDService] Batch size: {self._batch_sz} | Batch wait: {batch_wait_ms}ms")
         print(f"[IDService] Cache TTL: {cache_ttl}s")
 
     def get_cached(self, track_id: int) -> Optional[str]:
@@ -349,34 +283,39 @@ class IdentificationService:
 
     def submit(
         self,
-        track_ids: list[int],
-        annotated_frame: np.ndarray,
+        track_id: int,
+        frame_with_box: np.ndarray,
         priority: Optional[float] = None,
     ) -> bool:
-        """Enqueue an annotated frame for background identification.
+        """Enqueue a single-object frame for background identification.
 
-        Returns True if enqueued, False if all tracks already in-flight or cached.
+        Parameters
+        ----------
+        track_id : int
+            The track ID of the object in the frame.
+        frame_with_box : np.ndarray
+            Full frame with only this object's bounding box drawn.
+        priority : float, optional
+            Priority for queue ordering (lower = earlier).
+
+        Returns True if enqueued, False if track already in-flight or cached.
         """
-        # Filter out cached and in-flight tracks
-        new_tracks = []
+        # Check if already cached or in-flight
         with self._ifl_lock:
-            for tid in track_ids:
-                if self._cache.get(tid) is None and tid not in self._inflight:
-                    new_tracks.append(tid)
-                    self._inflight.add(tid)
-
-        if not new_tracks:
-            return False
+            if self._cache.get(track_id) is not None:
+                return False
+            if track_id in self._inflight:
+                return False
+            self._inflight.add(track_id)
 
         item = PendingItem(
             priority=priority if priority is not None else time.monotonic(),
-            track_ids=new_tracks,
-            frame=annotated_frame.copy(),
+            track_id=track_id,
+            frame=frame_with_box.copy(),
         )
         self._q.put(item)
 
-        for tid in new_tracks:
-            self._set_prog(tid, "queued", 0.0)
+        self._set_prog(track_id, "queued", 0.0)
 
         return True
 
@@ -393,95 +332,55 @@ class IdentificationService:
         """Stop the dispatcher thread gracefully."""
         self._alive = False
         self._q.put(PendingItem(
-            priority=float("inf"), track_ids=[],
+            priority=float("inf"), track_id=-1,
             frame=np.zeros((1, 1, 3), np.uint8),
         ))
         self._thread.join(timeout=3.0)
 
     def _dispatch_loop(self) -> None:
-        """Collect batches from the queue and send to remote server."""
+        """Process items from the queue and send to remote server."""
         while self._alive:
             try:
-                first = self._q.get(timeout=1.0)
+                item = self._q.get(timeout=1.0)
             except queue.Empty:
                 self._cache.evict_expired()
                 continue
 
-            if not first.track_ids:  # stop sentinel
+            if item.track_id < 0:  # stop sentinel
                 break
 
-            batch: list[PendingItem] = [first]
-            all_track_ids = set(first.track_ids)
-
-            # Fill batch
-            deadline = time.monotonic() + self._batch_wait
-            while len(all_track_ids) < self._batch_sz:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                try:
-                    item = self._q.get(timeout=left)
-                except queue.Empty:
-                    break
-
-                if not item.track_ids:
-                    self._alive = False
-                    break
-
-                # Skip if already identified
-                skip = False
-                for tid in item.track_ids:
-                    if self._cache.get(tid) is not None:
-                        self._set_prog(tid, "done", 1.0, label=self._cache.get(tid))
-                        with self._ifl_lock:
-                            self._inflight.discard(tid)
-                    elif tid in all_track_ids:
-                        skip = True
-                    else:
-                        all_track_ids.add(tid)
-
-                if not skip:
-                    batch.append(item)
-
-            if not batch:
+            # Skip if already identified while waiting
+            if self._cache.get(item.track_id) is not None:
+                with self._ifl_lock:
+                    self._inflight.discard(item.track_id)
                 continue
 
-            for tid in all_track_ids:
-                self._set_prog(tid, "identifying", 0.2)
+            self._fire(item)
 
-            # Use the most recent frame for identification
-            latest_frame = max(batch, key=lambda x: x.submitted_at).frame
-
-            self._fire(latest_frame, list(all_track_ids))
-
-    def _fire(self, frame: np.ndarray, track_ids: list[int]) -> None:
-        """Execute API call and distribute results."""
-        for tid in track_ids:
-            self._set_prog(tid, "identifying", 0.5)
+    def _fire(self, item: PendingItem) -> None:
+        """Execute API call for a single object."""
+        track_id = item.track_id
+        self._set_prog(track_id, "identifying", 0.5)
 
         try:
             self.stats["requests"] += 1
-            results = self._client.identify_frame(frame, track_ids)
+            label = self._client.identify_frame(item.frame, track_id)
 
-            for tid in track_ids:
-                label = results.get(tid, "object")
-                self._cache.set(tid, label)
-                self._set_prog(tid, "done", 1.0, label=label)
-                self.stats["identified"] += 1
-                print(f"[IDService] ✓ #{tid} → \"{label}\"")
+            self._cache.set(track_id, label)
+            self._set_prog(track_id, "done", 1.0, label=label)
+            self.stats["identified"] += 1
+            print(f"[IDService] ✓ #{track_id} → \"{label}\"")
 
         except Exception as exc:
             self.stats["errors"] += 1
             msg = _trunc(str(exc), 80)
             print(f"[IDService] ✗ Error: {msg}")
-            for tid in track_ids:
-                self._cache.set(tid, "object")
-                self._set_prog(tid, "error", 1.0, label="object", error=msg)
+            self._cache.set(track_id, "object")
+            self._set_prog(track_id, "error", 1.0, label="object", error=msg)
 
         finally:
             with self._ifl_lock:
-                for tid in track_ids:
-                    self._inflight.discard(tid)
+                self._inflight.discard(track_id)
 
     def _set_prog(
         self,

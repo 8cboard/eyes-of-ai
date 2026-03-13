@@ -205,12 +205,12 @@ class TestIDService:
         from id_service import PendingItem
         a = PendingItem(
             priority=1.0,
-            track_ids=[1],
+            track_id=1,
             frame=np.zeros((100, 100, 3), np.uint8)
         )
         b = PendingItem(
             priority=2.0,
-            track_ids=[2],
+            track_id=2,
             frame=np.zeros((100, 100, 3), np.uint8)
         )
         assert a < b  # lower priority = served first

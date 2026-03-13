@@ -1,18 +1,33 @@
 """
-Remote LLM Server for VisionTracker — Single Object Mode
+remote_server/server.py — VisionTracker Remote LLM Server
 
-FastAPI server supporting both GGUF (llama-cpp-python) and Safetensors
-(transformers) vision-language models.
+FastAPI server for single-object visual identification.
+Supports GGUF (llama-cpp-python) and Safetensors (transformers) VLMs.
 
-Each request contains a full frame with a SINGLE bounding box drawn.
-The LLM returns a single common noun describing the boxed object.
+Recommended model: Qwen2-VL-7B-Instruct (state-of-the-art, <10 GB)
+  Main GGUF:  bartowski/Qwen2-VL-7B-Instruct-GGUF
+                Qwen2-VL-7B-Instruct-Q4_K_M.gguf  (~4.5 GB)
+  mmproj:     mmproj-Qwen2-VL-7B-Instruct-f16.gguf (~1.0 GB)
+  chat_format: qwen2-vl
 
-Auto-detects model format:
-- GGUF: File ends with .gguf extension
-- Safetensors: Directory contains model.safetensors or pytorch_model.bin
+Alternative: LLaVA-1.6-Mistral-7B (very stable with llama-cpp)
+  Main GGUF:  cjpais/llava-1.6-mistral-7b-gguf
+                llava-1.6-mistral-7b.Q4_K_M.gguf   (~4.4 GB)
+  mmproj:     mmproj-model-f16.gguf                (~631 MB)
+  chat_format: llava-1-6
 
-Model size limit: <10GB
+Quick start:
+  # Colab / Kaggle — install with CUDA wheels
+  pip install llama-cpp-python \\
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+  # Start server
+  python server.py \\
+    --model-path  /path/to/Qwen2-VL-7B-Instruct-Q4_K_M.gguf \\
+    --mmproj-path /path/to/mmproj-Qwen2-VL-7B-Instruct-f16.gguf
 """
+
+from __future__ import annotations
 
 import base64
 import io
@@ -25,310 +40,410 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 from pydantic import BaseModel
-
-# FastAPI imports
 from fastapi import FastAPI, HTTPException, Header
 import uvicorn
 
-app = FastAPI(title="VisionTracker Remote ID Server", version="2.1.0")
+app = FastAPI(title="VisionTracker Remote ID Server", version="3.0.0")
 
-# Global model instance
-_model = None
-_model_type = None  # 'gguf' or 'safetensors'
-_model_name = "unknown"
-_MAX_MODEL_SIZE_GB = 10
+# ─────────────────────────────────────────────────────────────────────────────
+# Global state
+# ─────────────────────────────────────────────────────────────────────────────
 
+_model       = None
+_model_type  = None   # 'gguf' | 'safetensors'
+_model_name  = "unknown"
+_MAX_GB      = 10.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Request / response models
+# ─────────────────────────────────────────────────────────────────────────────
 
 class IdentifyRequest(BaseModel):
-    annotated_image: str  # base64 JPEG (full frame with single box drawn)
+    annotated_image: str   # base64 JPEG — full frame with ONE green box drawn
 
 
 class IdentifyResponse(BaseModel):
-    result: str  # single common noun (e.g., "person", "car", "chair")
+    result: str            # single common noun, e.g. "person", "car"
 
 
-def _check_model_size(model_path: str) -> float:
-    """Check total size of model files in GB."""
-    path = Path(model_path)
-    if path.is_file():
-        return path.stat().st_size / (1024**3)
-    elif path.is_dir():
-        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-        return total / (1024**3)
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _model_size_gb(path: str) -> float:
+    p = Path(path)
+    if p.is_file():
+        return p.stat().st_size / (1024 ** 3)
+    if p.is_dir():
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / (1024 ** 3)
     return 0.0
 
 
-def _detect_model_type(model_path: str) -> Optional[str]:
-    """Auto-detect if model is GGUF or safetensors format."""
-    path = Path(model_path)
-
-    if not path.exists():
+def _detect_format(path: str) -> Optional[str]:
+    p = Path(path)
+    if not p.exists():
         return None
-
-    # Check for GGUF
-    if path.is_file() and path.suffix == ".gguf":
+    if p.is_file() and p.suffix.lower() == ".gguf":
         return "gguf"
-
-    # Check for safetensors in directory
-    if path.is_dir():
-        if (path / "model.safetensors").exists():
+    if p.is_dir():
+        if any(p.glob("*.safetensors")) or (p / "pytorch_model.bin").exists():
             return "safetensors"
-        if (path / "pytorch_model.bin").exists():
-            return "safetensors"
-        # Check for .safetensors files
-        if list(path.glob("*.safetensors")):
-            return "safetensors"
-
     return None
 
 
-def load_gguf_model(model_path: str):
-    """Load GGUF model using llama-cpp-python."""
+def _auto_chat_format(model_stem: str) -> Optional[str]:
+    """Guess the llama-cpp chat_format from the model filename stem."""
+    s = model_stem.lower()
+    if "qwen2-vl" in s or "qwen2vl" in s:
+        return "qwen2-vl"
+    if "llava-1.6" in s or "llava-1-6" in s or "llava1.6" in s:
+        return "llava-1-6"
+    if "llava" in s:
+        return "llava-1-5"
+    if "minicpm" in s:
+        return "minicpm-v"
+    if "phi-3" in s or "phi3" in s:
+        return "chatml"
+    if "mistral" in s or "mixtral" in s:
+        return "mistral-instruct"
+    return None   # let llama-cpp auto-detect
+
+
+def load_gguf_model(
+    model_path: str,
+    mmproj_path: Optional[str] = None,
+    chat_format: Optional[str] = None,
+    n_ctx: int = 4096,
+) -> None:
+    """Load a GGUF vision-language model via llama-cpp-python.
+
+    Parameters
+    ----------
+    model_path  : path to the main .gguf file
+    mmproj_path : path to the vision-encoder (mmproj) .gguf file.
+                  Required for LLaVA-style and Qwen2-VL models.
+                  Without this the model is effectively text-only.
+    chat_format : llama-cpp chat format string (auto-detected if None)
+    n_ctx       : context length
+    """
     global _model, _model_type, _model_name
 
     from llama_cpp import Llama
 
-    print(f"Loading GGUF model: {model_path}")
-    print(f"Model size: {_check_model_size(model_path):.2f} GB")
+    print(f"[Server] Loading GGUF model: {model_path}")
+    print(f"[Server] Model size: {_model_size_gb(model_path):.2f} GB")
 
-    _model = Llama(
+    kwargs: dict = dict(
         model_path=model_path,
-        n_ctx=4096,
-        n_gpu_layers=-1,  # Use all GPU layers
+        n_ctx=n_ctx,
+        n_gpu_layers=-1,   # offload all layers to GPU
         verbose=False,
     )
+
+    if mmproj_path:
+        if not Path(mmproj_path).exists():
+            raise FileNotFoundError(f"mmproj file not found: {mmproj_path}")
+        kwargs["clip_model_path"] = mmproj_path
+        print(f"[Server] Vision encoder (mmproj): {mmproj_path}")
+        print(f"[Server] mmproj size: {_model_size_gb(mmproj_path):.2f} GB")
+    else:
+        print(
+            "[Server] WARNING: --mmproj-path not provided.\n"
+            "         Vision models (LLaVA, Qwen2-VL, etc.) need a separate\n"
+            "         vision-encoder file to process images.\n"
+            "         Without it the model is TEXT-ONLY and cannot see images.\n"
+            "         Download the matching mmproj-*.gguf from HuggingFace."
+        )
+
+    # Resolve chat format
+    resolved_fmt = chat_format or _auto_chat_format(Path(model_path).stem)
+    if resolved_fmt:
+        kwargs["chat_format"] = resolved_fmt
+        print(f"[Server] chat_format: {resolved_fmt}")
+    else:
+        print("[Server] chat_format: auto-detect (llama-cpp default)")
+
+    _model      = Llama(**kwargs)
     _model_type = "gguf"
     _model_name = Path(model_path).stem
-    print("GGUF model loaded successfully")
+    print(f"[Server] ✓ GGUF model loaded: {_model_name}")
 
 
-def load_safetensors_model(model_path: str):
-    """Load safetensors model using transformers."""
+def load_safetensors_model(model_path: str) -> None:
+    """Load a HuggingFace safetensors VLM via transformers."""
     global _model, _model_type, _model_name
 
     import torch
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoProcessor
 
-    print(f"Loading Safetensors model: {model_path}")
-    print(f"Model size: {_check_model_size(model_path):.2f} GB")
+    print(f"[Server] Loading Safetensors model: {model_path}")
+    print(f"[Server] Model size: {_model_size_gb(model_path):.2f} GB")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    dtype  = torch.float16 if device == "cuda" else torch.float32
+    print(f"[Server] Device: {device} | dtype: {dtype}")
 
-    processor = AutoProcessor.from_pretrained(model_path)
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto" if device == "cuda" else None,
-    )
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
-    _model = {"model": model, "processor": processor, "device": device}
+    # Try model classes in order of preference for VLMs
+    model = None
+    tried = []
+    for cls_name in [
+        "AutoModelForVision2Seq",
+        "AutoModelForCausalLM",
+        "AutoModel",
+    ]:
+        try:
+            import transformers
+            cls = getattr(transformers, cls_name)
+            model = cls.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                device_map="auto" if device == "cuda" else None,
+                trust_remote_code=True,
+            )
+            print(f"[Server] Loaded with {cls_name}")
+            break
+        except Exception as exc:
+            tried.append(f"{cls_name}: {exc}")
+
+    if model is None:
+        raise RuntimeError(
+            f"Could not load model from {model_path}.\nAttempts:\n"
+            + "\n".join(tried)
+        )
+
+    if device == "cpu":
+        model = model.to(device)
+
+    _model      = {"model": model, "processor": processor, "device": device}
     _model_type = "safetensors"
     _model_name = Path(model_path).name
-    print("Safetensors model loaded successfully")
+    print(f"[Server] ✓ Safetensors model loaded: {_model_name}")
 
 
-def load_model(model_path: str):
-    """Load model with auto-detection of format."""
-    size_gb = _check_model_size(model_path)
-    if size_gb > _MAX_MODEL_SIZE_GB:
+def load_model(
+    model_path: str,
+    mmproj_path: Optional[str] = None,
+    chat_format: Optional[str] = None,
+) -> None:
+    """Auto-detect model format and load accordingly."""
+    size = _model_size_gb(model_path)
+    if mmproj_path:
+        size += _model_size_gb(mmproj_path)
+
+    if size > _MAX_GB:
         raise ValueError(
-            f"Model size ({size_gb:.2f} GB) exceeds limit of {_MAX_MODEL_SIZE_GB} GB"
+            f"Combined model size ({size:.2f} GB) exceeds limit of {_MAX_GB} GB"
         )
 
-    model_type = _detect_model_type(model_path)
-    if model_type is None:
+    fmt = _detect_format(model_path)
+    if fmt is None:
         raise ValueError(
-            f"Could not detect model format for: {model_path}\n"
-            "Expected .gguf file or directory with model.safetensors"
+            f"Cannot detect model format for: {model_path}\n"
+            "Expected a .gguf file or a directory with *.safetensors files."
         )
 
-    if model_type == "gguf":
-        load_gguf_model(model_path)
-    elif model_type == "safetensors":
-        load_safetensors_model(model_path)
+    if fmt == "gguf":
+        load_gguf_model(model_path, mmproj_path=mmproj_path, chat_format=chat_format)
     else:
-        raise ValueError(f"Unsupported model type: {model_type}")
+        load_safetensors_model(model_path)
 
 
-SINGLE_OBJECT_PROMPT = """Look at the image. There is a green bounding box drawn around one object.
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-What object is inside the bounding box?
+_PROMPT = (
+    "There is a green bounding box drawn around exactly one object in this image.\n"
+    "What is the object inside the green box?\n\n"
+    "Answer with ONLY one short noun phrase (1–3 words). "
+    "Use everyday words like: person, car, dog, chair, laptop, bottle, cup, phone, book.\n"
+    "Do NOT explain. Do NOT say 'I see'. Output the noun only."
+)
 
-Answer with exactly ONE common noun. Use simple everyday words like: person, car, dog, cat, chair, table, phone, book, cup, bottle, backpack, laptop, etc.
 
-Respond with only the noun, nothing else. Examples: "person", "car", "wooden chair", "coffee mug"
-"""
+def _identify_gguf(image: Image.Image) -> str:
+    img_buf = io.BytesIO()
+    image.save(img_buf, format="JPEG", quality=90)
+    img_b64 = base64.b64encode(img_buf.getvalue()).decode()
 
-
-def identify_with_gguf(image: Image.Image) -> str:
-    """Run single-object identification using GGUF model."""
-    import io
-
-    # Convert image to base64 for llama-cpp
-    img_buffer = io.BytesIO()
-    image.save(img_buffer, format="JPEG", quality=90)
-    img_b64 = base64.b64encode(img_buffer.getvalue()).decode()
-
-    content = [
-        {"type": "text", "text": SINGLE_OBJECT_PROMPT},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text",      "text": _PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+            ],
+        }
     ]
 
-    messages = [{"role": "user", "content": content}]
-
-    response = _model.create_chat_completion(
+    resp = _model.create_chat_completion(
         messages=messages,
-        max_tokens=50,
-        temperature=0.2,
-        stop=["</s>", "\n"],
+        max_tokens=30,
+        temperature=0.1,
+        stop=["</s>", "\n", "<|im_end|>", "<|endoftext|>"],
     )
+    raw = resp["choices"][0]["message"]["content"].strip()
+    return _parse_noun(raw)
 
-    raw_text = response["choices"][0]["message"]["content"].strip()
-    return parse_single_response(raw_text)
 
-
-def identify_with_safetensors(image: Image.Image) -> str:
-    """Run single-object identification using Safetensors model."""
+def _identify_safetensors(image: Image.Image) -> str:
     import torch
-
-    model = _model["model"]
+    model     = _model["model"]
     processor = _model["processor"]
-    device = _model["device"]
+    device    = _model["device"]
 
-    # Process inputs
-    inputs = processor(text=SINGLE_OBJECT_PROMPT, images=image, return_tensors="pt")
+    try:
+        inputs = processor(
+            text=_PROMPT, images=image, return_tensors="pt"
+        )
+    except TypeError:
+        # Some processors don't accept 'text' as a positional-only kwarg
+        inputs = processor(images=image, text=_PROMPT, return_tensors="pt")
+
     if device == "cuda":
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    # Generate
     with torch.no_grad():
-        outputs = model.generate(
+        out = model.generate(
             **inputs,
             max_new_tokens=20,
-            temperature=0.2,
-            do_sample=True,
+            temperature=0.1,
+            do_sample=False,
         )
 
-    # Decode
-    raw_text = processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
-    return parse_single_response(raw_text)
+    raw = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
+    # Remove echoed prompt if present
+    if _PROMPT[:20] in raw:
+        raw = raw.split(_PROMPT[-20:])[-1].strip()
+    return _parse_noun(raw)
 
 
-def parse_single_response(text: str) -> str:
-    """Parse LLM response to extract single common noun."""
-    # Clean up the response
+def _parse_noun(text: str) -> str:
+    """Normalise raw LLM output to a clean 1–3 word noun phrase."""
     text = text.strip().lower()
-
-    # Remove quotes if present
-    text = text.strip('"\'')
-
-    # Take only the first line if multiple lines
-    text = text.split('\n')[0].strip()
-
-    # Remove trailing punctuation
-    text = re.sub(r'[.!?]+$', '', text).strip()
-
-    # Validate: should be a reasonable noun phrase (1-3 words)
+    text = text.strip("\"'`")
+    text = text.split("\n")[0].strip()
+    text = re.sub(r"[.!?]+$", "", text).strip()
+    # Drop common preamble phrases
+    for prefix in ("it is a ", "it is an ", "this is a ", "this is an ",
+                   "i see a ", "i see an ", "the object is a ", "the object is "):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    text = re.sub(r"[^\w\s\-]", "", text).strip()
     words = text.split()
-    if len(words) == 0 or len(words) > 4:
+    if not words or len(words) > 4:
         return "object"
+    return " ".join(words[:3])   # cap at 3 words
 
-    # Clean up any remaining special characters
-    text = re.sub(r'[^\w\s-]', '', text).strip()
 
-    return text if text else "object"
-
+# ─────────────────────────────────────────────────────────────────────────────
+# API endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint."""
+async def health():
     return {
-        "status": "healthy",
+        "status": "healthy" if _model is not None else "no_model",
         "model": _model_name,
         "type": _model_type,
-        "version": "2.1.0",
+        "version": "3.0.0",
     }
 
 
 @app.post("/identify", response_model=IdentifyResponse)
 async def identify(
-    request: IdentifyRequest,
-    authorization: Optional[str] = Header(None)
+    req: IdentifyRequest,
+    authorization: Optional[str] = Header(None),
 ):
-    """Identify the single object in the provided annotated frame."""
-    # Check API key if configured
+    """Identify the single object framed by the green bounding box."""
     server_key = os.environ.get("SERVER_API_KEY")
     if server_key and authorization != f"Bearer {server_key}":
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     if _model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
 
     try:
-        # Decode image
-        img_bytes = base64.b64decode(request.annotated_image)
-        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img_bytes = base64.b64decode(req.annotated_image)
+        image     = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
 
-        # Run identification
+    try:
         if _model_type == "gguf":
-            result = identify_with_gguf(image)
+            result = _identify_gguf(image)
         elif _model_type == "safetensors":
-            result = identify_with_safetensors(image)
+            result = _identify_safetensors(image)
         else:
             raise HTTPException(status_code=500, detail="Unknown model type")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
-        return IdentifyResponse(result=result)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return IdentifyResponse(result=result)
 
 
-def main():
-    """Main entry point."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="VisionTracker Remote LLM Server")
-    parser.add_argument(
-        "--model-path",
-        required=True,
-        help="Path to model (.gguf file or safetensors directory)",
+    p = argparse.ArgumentParser(
+        description=(
+            "VisionTracker Remote LLM Server\n\n"
+            "Recommended model (best quality, <10 GB):\n"
+            "  Qwen2-VL-7B-Instruct-Q4_K_M.gguf  (~4.5 GB)\n"
+            "  mmproj-Qwen2-VL-7B-Instruct-f16.gguf (~1 GB)\n"
+            "  Download from: https://huggingface.co/bartowski/Qwen2-VL-7B-Instruct-GGUF\n\n"
+            "Alternative (most stable with llama-cpp):\n"
+            "  llava-1.6-mistral-7b.Q4_K_M.gguf   (~4.4 GB)\n"
+            "  mmproj-model-f16.gguf               (~631 MB)\n"
+            "  Download from: https://huggingface.co/cjpais/llava-1.6-mistral-7b-gguf\n\n"
+            "Install llama-cpp-python with CUDA 12.1:\n"
+            "  pip install llama-cpp-python \\\n"
+            "    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host to bind to (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to bind to (default: 8000)",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Optional API key for authentication",
-    )
+    p.add_argument("--model-path",  required=True,
+                   help="Path to .gguf file or safetensors model directory")
+    p.add_argument("--mmproj-path", default=None,
+                   help="Path to vision-encoder mmproj .gguf file (required for "
+                        "LLaVA / Qwen2-VL and most other GGUF VLMs)")
+    p.add_argument("--chat-format", default=None,
+                   help="llama-cpp chat format override (auto-detected if omitted)")
+    p.add_argument("--host",   default="0.0.0.0")
+    p.add_argument("--port",   type=int, default=8000)
+    p.add_argument("--api-key", default=None,
+                   help="Optional bearer token for /identify endpoint")
+    p.add_argument("--n-ctx",  type=int, default=4096,
+                   help="Context length for GGUF models (default: 4096)")
+    args = p.parse_args()
 
-    args = parser.parse_args()
-
-    # Set API key from env if provided via CLI
     if args.api_key:
         os.environ["SERVER_API_KEY"] = args.api_key
 
-    # Load model
-    print("=" * 60)
-    print("VisionTracker Remote LLM Server")
-    print("=" * 60)
-    load_model(args.model_path)
-    print("=" * 60)
-    print(f"Server ready at http://{args.host}:{args.port}")
-    if os.environ.get("SERVER_API_KEY"):
-        print("API key authentication enabled")
-    print("=" * 60)
+    print("=" * 62)
+    print("  VisionTracker Remote LLM Server  v3.0.0")
+    print("=" * 62)
 
-    # Start server
+    load_model(
+        model_path=args.model_path,
+        mmproj_path=args.mmproj_path,
+        chat_format=args.chat_format,
+    )
+
+    print("=" * 62)
+    print(f"  Listening on http://{args.host}:{args.port}")
+    if os.environ.get("SERVER_API_KEY"):
+        print("  API key authentication: enabled")
+    print("=" * 62)
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

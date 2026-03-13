@@ -36,10 +36,14 @@ from typing import Literal, Optional
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# ByteTrack is hardcoded disabled in this simplified architecture
-# Only CentroidTracker is used for pure CPU operation
-_SUPERVISION_AVAILABLE = False
-sv = None  # type: ignore
+# Try to import supervision for ByteTrack support
+# Falls back to CentroidTracker if not available
+try:
+    import supervision as sv
+    _SUPERVISION_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _SUPERVISION_AVAILABLE = False
+    sv = None  # type: ignore
 
 from edge_detector import DetectionResult
 
@@ -437,15 +441,25 @@ def build_tracker(
 ) -> Tracker:
     """Return a Tracker instance.
 
-    In this simplified architecture, ByteTrack is hardcoded disabled.
-    Only CentroidTracker is available.
-
     Parameters
     ----------
     tracker_type : str
-        Ignored — always returns CentroidTracker.
+        'centroid' (default) or 'bytetrack'. ByteTrack requires supervision.
     **kwargs
         Passed to the tracker constructor.
+
+    Returns
+    -------
+    Tracker
+        CentroidTracker or ByteTrackWrapper depending on availability and choice.
     """
-    # ByteTrack is hardcoded disabled — always use CentroidTracker
-    return CentroidTracker(**kwargs)
+    if tracker_type == "bytetrack":
+        if _SUPERVISION_AVAILABLE:
+            return ByteTrackWrapper(**kwargs)
+        else:
+            print("[Tracker] supervision not available — falling back to CentroidTracker")
+            return CentroidTracker(**kwargs)
+    elif tracker_type == "centroid":
+        return CentroidTracker(**kwargs)
+    else:
+        raise ValueError(f"Unknown tracker type: {tracker_type!r}. Choose 'bytetrack' or 'centroid'.")

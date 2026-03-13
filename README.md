@@ -1,8 +1,6 @@
-# 🎯 VisionTracker — Real-Time Edge Detection, Tracking & Remote LLM Identification
+# 🎯 VisionTracker — Real-Time Object Detection, Tracking & Remote LLM Identification
 
-> **Simplified Architecture — Edge Detection + Remote LLM**
->
-> Local machine runs edge detection and tracking, sends annotated frames to remote Kaggle/Colab server running vision-language model.
+VisionTracker performs real-time edge detection, multi-object tracking, and sends annotated frames to a remote vision-language model for object identification.
 
 **Quickstart:**
 ```bash
@@ -22,42 +20,27 @@ python main.py
 
 ---
 
-## What's New (Simplified Architecture)
-
-This is a major architecture simplification:
-
-| Before | After |
-|--------|-------|
-| YOLO object detection | OpenCV edge/contour detection |
-| ByteTrack + Centroid | Centroid only (ByteTrack hardcoded disabled) |
-| Stillness gating | Continuous identification (no stillness logic) |
-| Individual crop submission | Full annotated frame submission |
-| OpenRouter API support | Remote Kaggle/Colab server only |
-| Single model (Nemotron) | Flexible: GGUF or safetensors (<10GB) |
-
----
-
-## Architecture Diagram
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                      VisionTracker Pipeline (Simplified)                     │
+│                         VisionTracker Pipeline                               │
 │                                                                              │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌─────────────────────┐   │
-│  │  Camera  │───▶│  Edge    │───▶│Centroid  │───▶│  Draw Colored Boxes │   │
-│  │ Capture  │    │ Detector │    │ Tracker  │    │  & Track Labels     │   │
-│  │ 720p/30  │    │(Canny + │    │          │    └────────┬────────────┘   │
-│  │ frames   │    │ Contours)│    │          │             │                │
+│  │  Camera  │───▶│  Edge    │───▶│ Tracker  │───▶│  Draw Colored Boxes │   │
+│  │ Capture  │    │ Detector │    │(ByteTrack│    │  & Object Labels    │   │
+│  │          │    │(Canny + │    │/Centroid)│    └────────┬────────────┘   │
+│  │          │    │ Contours)│    │          │             │                │
 │  └──────────┘    └──────────┘    └──────────┘             │                │
 │                                                            ▼                │
 │  ┌──────────┐    ┌──────────┐                   ┌─────────────────────┐    │
 │  │  Cache   │◀───│ Remote   │◀──────────────────│  Annotated Frame    │    │
 │  │(per-track│    │  LLM     │                   │  (with boxes drawn) │    │
 │  │ TTL dict)│    │ Service  │                   │                     │    │
-│  └──────────┘    │          │                   │  Sent every 10th    │    │
-│        │         │ Priority │                   │  frame with visible │    │
-│        │         │ Queue    │                   │  tracks             │    │
-│        │         │          │                   └─────────────────────┘    │
+│  └──────────┘    │          │                   │  Sent periodically  │    │
+│        │         │ Priority │                   │  with visible tracks│    │
+│        │         │ Queue    │                   └─────────────────────┘    │
+│        │         │          │                                              │
 │        │         │   ↓      │                                              │
 │        │         │ HTTP POST│                                              │
 │        │         │ to remote│                                              │
@@ -68,28 +51,28 @@ This is a major architecture simplification:
 │        ▼                                                   ▼                │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                        UI Overlay (OpenCV)                          │   │
-│  │   [Track ID] [Label / "Identifying…"] [Colored Box] [FPS]          │   │
+│  │   [Object Name] [Colored Box] [Status Dot] [FPS]                   │   │
 │  │   [● green=done] [● orange=in-progress]                            │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Component Roles
+### Components
 
 | Component | File | Role |
 |---|---|---|
-| **Camera Capture** | `main.py` | Reads 720p frames via `cv2.VideoCapture`. Forces resolution, reduces buffer latency. |
-| **Edge Detector** | `edge_detector.py` | OpenCV Canny edge detection + contour finding. Returns bounding boxes for "interesting" regions. No ML models needed. |
-| **Tracker** | `tracker.py` | `CentroidTracker` (pure-Python + scipy). ByteTrack is hardcoded disabled for simplified architecture. |
-| **Remote LLM Service** | `remote_llm_service.py` | Sends full annotated frames (with colored boxes) to remote server. Receives descriptions for all visible tracks. |
-| **Cache** | `remote_llm_service.py` | Per-track TTL cache prevents re-identification until TTL expires. |
-| **UI Overlay** | `main.py` | Draws colored bounding boxes, label blocks, status dots, and a HUD bar. |
+| **Camera Capture** | `main.py` | Reads frames via OpenCV. Configurable resolution, reduced buffer latency. |
+| **Edge Detector** | `edge_detector.py` | Canny edge detection + contour finding. Detects regions of interest without ML models. |
+| **Tracker** | `tracker.py` | `ByteTrack` (via supervision) or `CentroidTracker` (pure Python). Maintains persistent object IDs. |
+| **Remote LLM Service** | `remote_llm_service.py` | Sends annotated frames to remote server. Receives object identifications. |
+| **Cache** | `remote_llm_service.py` | Per-track TTL cache prevents redundant identifications. |
+| **UI Overlay** | `main.py` | Draws colored bounding boxes, object labels, status indicators. |
 
 ---
 
 ## Remote Server (Kaggle/Colab)
 
-The remote server runs a vision-language model that receives annotated frames and returns descriptions for objects in colored boxes.
+The remote server runs a vision-language model that receives annotated frames and returns object identifications as single common nouns (e.g., "person", "car", "chair").
 
 ### Supported Model Formats
 
@@ -151,6 +134,9 @@ python main.py --remote-url https://xxx.ngrok.io
 # With optional API key
 python main.py --remote-url https://xxx.ngrok.io --remote-key your-key
 
+# Use ByteTrack instead of CentroidTracker
+python main.py --tracker bytetrack
+
 # Save output to video file
 python main.py --save-video output.mp4
 
@@ -173,6 +159,12 @@ python main.py --no-display
 --batch-wait 500       ms to wait before dispatching frame
 ```
 
+### Tracker
+```
+--tracker centroid     Tracker type: centroid (default) or bytetrack
+--max-disappeared 20   Frames before track is dropped (CentroidTracker only)
+```
+
 ### Camera & Detection
 ```
 --input 0              Camera index (0) or path to video file
@@ -186,11 +178,6 @@ python main.py --no-display
 --canny-high 150       Canny upper threshold
 ```
 
-### Tracker
-```
---max-disappeared 20   Frames before track is dropped
-```
-
 ### Output
 ```
 --no-display           Headless mode (no OpenCV window)
@@ -199,7 +186,7 @@ python main.py --no-display
 
 ---
 
-## Performance Expectations
+## Performance
 
 | Configuration | Expected FPS | Notes |
 |---|---|---|
@@ -207,15 +194,14 @@ python main.py --no-display
 | CPU, skip=2, grayscale | **25–40 FPS** | Recommended for slow CPUs |
 | CPU, 640×360, skip=2 | **35–50 FPS** | Lowest latency mode |
 
-> Identification runs in a background thread — **does not affect FPS**.
-> Expect 1–5s per frame depending on remote server hardware.
+Identification runs in a background thread and does not affect FPS. Response time depends on remote server hardware (typically 1–5s per frame).
 
 ---
 
 ## Privacy & Security
 
-**Annotated frames are sent to YOUR server on Colab/Kaggle via HTTPS.**
-- Images never touch third-party APIs (no OpenRouter)
+Annotated frames are sent to YOUR server on Colab/Kaggle via HTTPS:
+- Images never touch third-party APIs
 - Your data stays within your control
 - ngrok tunnels are encrypted end-to-end
 - Add API key for additional security: `--remote-key`
@@ -237,44 +223,29 @@ vision_tracker/
 ├── README.md
 ├── requirements.txt
 ├── install.sh              ← Linux/macOS install
-├── install.ps1             ← Windows install (NEW)
-├── .env.example            ← copy to .env and fill in REMOTE_LLM_URL
-├── main.py                 ← entry point (simplified architecture)
-├── edge_detector.py        ← NEW: OpenCV edge/contour detection (replaces YOLO)
-├── tracker.py              ← CentroidTracker only (ByteTrack hardcoded disabled)
-├── remote_llm_service.py   ← NEW: Remote LLM client (replaces OpenRouter)
+├── install.ps1             ← Windows install
+├── .env.example            ← Environment variables template
+├── main.py                 ← Entry point
+├── edge_detector.py        ← OpenCV edge/contour detection
+├── tracker.py              ← ByteTrack + CentroidTracker
+├── remote_llm_service.py   ← Remote LLM client
 ├── ui_overlay.py           ← OpenCV drawing utilities
 ├── remote_server/          ← Colab/Kaggle server setup
 │   ├── requirements.txt
-│   ├── colab_setup.ipynb   ← Updated for GGUF/safetensors
-│   └── kaggle_setup.ipynb  ← Updated for GGUF/safetensors
+│   ├── colab_setup.ipynb
+│   └── kaggle_setup.ipynb
 └── tests/
     ├── __init__.py
     ├── conftest.py
-    └── test_smoke.py       ← Updated for new architecture
+    └── test_smoke.py
 ```
-
----
-
-## Migration from Old Architecture
-
-If you were using the previous version:
-
-| Old | New |
-|-----|-----|
-| `--openrouter-key KEY` | `--remote-url URL` (from Colab/Kaggle) |
-| `--use-remote-gemma` | Default behavior (only remote server) |
-| `--detector yolov8n.pt` | Removed — now uses edge detection |
-| `--tracker bytetrack` | Ignored — only CentroidTracker |
-| `--still-frames N` | Removed — continuous identification |
-| `--batch-size N` | Removed — one frame per request |
 
 ---
 
 ## Troubleshooting
 
 ### "Remote LLM URL is required"
-- You must run the remote server first (Colab/Kaggle notebook)
+- Run the remote server first (Colab/Kaggle notebook)
 - Set the URL: `export REMOTE_LLM_URL=https://xxx.ngrok.io`
 
 ### No objects detected
@@ -284,6 +255,10 @@ If you were using the previous version:
 ### Connection errors
 - Ensure the Colab/Kaggle notebook is still running
 - ngrok free tier sessions expire after ~2 hours — restart the notebook
+
+### ByteTrack not available
+- Install supervision: `pip install supervision`
+- Falls back to CentroidTracker if not installed
 
 ---
 

@@ -58,9 +58,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-frames", type=int, default=1,
                    help="Run detector every N frames (1=every frame)")
 
-    # Tracker (Centroid only)
+    # Tracker
+    p.add_argument("--tracker", default="centroid", choices=["centroid", "bytetrack"],
+                   help="Tracker type (ByteTrack requires: pip install supervision)")
     p.add_argument("--max-disappeared", type=int, default=20,
-                   help="Frames before track is dropped")
+                   help="Frames before track is dropped (CentroidTracker only)")
 
     # Remote LLM Service
     p.add_argument("--remote-url", default=None,

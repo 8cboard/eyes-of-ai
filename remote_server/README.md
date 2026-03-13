@@ -1,204 +1,233 @@
-# 🌐 VisionTracker Remote Server
+# VisionTracker Remote LLM Server
 
-Self-hosted Gemma 3 4B vision-language model server for VisionTracker object identification. Run on Google Colab or Kaggle for private, rate-limit-free identification.
+FastAPI server supporting both GGUF (llama-cpp-python) and Safetensors (transformers) vision-language models for VisionTracker identification.
 
-## Why Self-Host?
+## Features
 
-| Feature | OpenRouter Free | Self-Hosted (This) |
-|---------|-----------------|-------------------|
-| **Rate Limit** | ~20 RPM | Unlimited (you control it) |
-| **Privacy** | Sends images to third-party | Your server, your data |
-| **Cost** | Free | Free (Colab/Kaggle tiers) |
-| **Latency** | Network variable | 1-3s after warmup |
-| **Setup** | API key only | ~5 minute setup |
+- **Auto-detects model format**: GGUF by `.gguf` extension, Safetensors by directory structure
+- **Model size limit**: <10GB (enforced on load)
+- **Prompt engineering**: Optimized for single common noun responses
+- **Secure**: Optional API key authentication
 
 ## Quick Start
 
-### Option 1: Google Colab (Recommended for beginners)
+### 1. Install Dependencies
 
-1. Open `colab_setup.ipynb` in Google Colab
-2. Runtime → Change runtime type → GPU (T4)
-3. Follow the 6 cells:
-   - Install dependencies
-   - Configure ngrok (get free token at [ngrok.com](https://dashboard.ngrok.com/signup))
-   - Download Gemma 3 4B model (~3.3GB)
-   - Load model & warmup
-   - Create FastAPI server
-   - Start tunnel & server
+```bash
+cd remote_server
+pip install -r requirements.txt
+```
 
-4. Copy the **Public URL** from output
-5. Run VisionTracker locally:
-   ```bash
-   python main.py --use-remote-gemma --remote-gemma-url https://abc123.ngrok.io
-   ```
+### 2. Download a Vision Model
 
-### Option 2: Kaggle (More GPU RAM)
+**GGUF (Recommended for smaller GPUs):**
+```bash
+# Gemma 3 4B IT - Q4_K_M quantized (~3.3GB)
+wget https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf
+```
 
-1. Create Kaggle account at [kaggle.com](https://kaggle.com)
-2. Open `kaggle_setup.ipynb` in Kaggle
-3. Settings → Accelerator → GPU (T4/P100)
-4. Settings → Internet → On
-5. Add ngrok token to Secrets: Add-ons → Secrets → `NGROK_AUTHTOKEN`
-6. Run all cells
-7. Use the public URL in VisionTracker
+**Safetensors (Better quality, needs more VRAM):**
+```bash
+# Will be auto-downloaded on first use
+# Or download manually with huggingface-cli
+huggingface-cli download google/gemma-3-4b-it
+```
 
-## Model Details
+### 3. Start Server
 
-- **Model**: Gemma 3 4B IT (instruction-tuned)
-- **Quantization**: Q4_K_M (4-bit, ~3.3GB)
-- **Original**: Google Gemma 3 4B
-- **Context**: 4096 tokens
-- **VRAM**: ~4GB (fits in both Colab T4 and Kaggle P100)
+**GGUF:**
+```bash
+python server.py --model-path ./gemma-3-4b-it-Q4_K_M.gguf
+```
 
-## API Endpoints
+**Safetensors:**
+```bash
+python server.py --model-path /path/to/gemma-3-4b-it
+```
+
+**With API key:**
+```bash
+python server.py --model-path ./model.gguf --api-key your-secret-key
+```
+
+### 4. Public Access (ngrok)
+
+```bash
+# Install ngrok: https://ngrok.com/download
+ngrok http 8000
+
+# Use the https URL in VisionTracker:
+# python main.py --remote-url https://abc123.ngrok.io
+```
+
+## API Reference
 
 ### Health Check
-```bash
+```
 GET /health
 
 Response:
 {
   "status": "healthy",
-  "model": "gemma-3-4b-it",
-  "version": "1.0.0"
+  "model": "gemma-3-4b-it-Q4_K_M",
+  "type": "gguf",
+  "version": "2.0.0"
 }
 ```
 
 ### Identify Objects
-```bash
+```
 POST /identify
 Content-Type: application/json
 Authorization: Bearer <optional-api-key>
 
 Request:
 {
-  "images": ["base64_jpeg_1", "base64_jpeg_2"],
-  "class_names": ["person", "chair"],
-  "track_ids": [1, 2]
+  "annotated_image": "base64_jpeg_string",
+  "color_map": {
+    "red": 1,
+    "blue": 2,
+    "green": 3
+  }
 }
 
 Response:
 {
   "results": [
-    {"track_id": 1, "description": "a person in a blue jacket"},
-    {"track_id": 2, "description": "a wooden chair with cushion"}
+    {"track_id": 1, "description": "person"},
+    {"track_id": 2, "description": "car"},
+    {"track_id": 3, "description": "dog"}
   ]
 }
 ```
 
-## Security
+## Supported Models
 
-### API Key (Optional but Recommended)
+### GGUF (llama-cpp-python)
 
-Add an API key to prevent unauthorized access:
+| Model | Size | VRAM | Quality |
+|-------|------|------|---------|
+| gemma-3-4b-it-Q4_K_M | ~3.3GB | ~4GB | Good |
+| gemma-3-4b-it-Q5_K_M | ~4.2GB | ~5GB | Better |
+| gemma-3-4b-it-Q6_K | ~5.0GB | ~6GB | Best |
 
-**Colab**: Click 🔑 in left sidebar → Add secret: `SERVER_API_KEY`
+Download from: https://huggingface.co/lmstudio-community
 
-**Kaggle**: Add-ons → Secrets → Add secret: `SERVER_API_KEY`
+### Safetensors (transformers)
 
-Then pass it to VisionTracker:
-```bash
-python main.py --use-remote-gemma \
-  --remote-gemma-url https://abc123.ngrok.io \
-  --remote-gemma-key your-secret-key
-```
+| Model | Size | VRAM | Notes |
+|-------|------|------|-------|
+| google/gemma-3-4b-it | ~8GB | ~10GB | Fits on P100, may OOM on T4 |
+| microsoft/Phi-4-multimodal-instruct | ~14GB | ~16GB | Exceeds 10GB limit |
 
-### ngrok Considerations
+## Cloud Deployment
 
-- Free tier: 1 tunnel, ~2hr sessions, 40 conn/min
-- URLs change on restart
-- Use paid ngrok for persistent URLs
-- Consider Cloudflare Tunnel for longer sessions
+### Google Colab
+
+1. Open `colab_setup.ipynb` in Google Colab
+2. Runtime → Change runtime type → GPU (T4)
+3. Run all cells
+4. Copy the public URL from output
+
+### Kaggle
+
+1. Create notebook from `kaggle_setup.ipynb`
+2. Settings → Accelerator → GPU
+3. Add ngrok token to Secrets
+4. Run all cells
 
 ## Troubleshooting
 
 ### Out of Memory
-Reduce GPU layers in notebook:
-```python
-llm = Llama(
-    model_path=MODEL_PATH,
-    n_ctx=2048,        # Reduce from 4096
-    n_gpu_layers=20,   # Instead of -1 (all)
-    verbose=False
-)
-```
+
+**Reduce GPU layers (GGUF):**
+Edit server.py and change `n_gpu_layers=-1` to `n_gpu_layers=20`
+
+**Use CPU:**
+Set `n_gpu_layers=0` in server.py
+
+**Use smaller model:**
+Download Q4_K_M instead of Q5_K_M or Q6_K
 
 ### Slow First Request
-This is normal - CUDA kernels are initializing. Subsequent requests are fast.
 
-### Connection Refused
-- Keep the Colab/Kaggle notebook running
-- Check ngrok tunnel status
-- Verify the URL hasn't changed (free tier rotates URLs)
+This is normal - CUDA kernels are initializing. Subsequent requests are faster.
 
-### Model Download Fails
-```bash
-# Manual download fallback
-!wget https://huggingface.co/lmstudio-community/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf
-```
+### Model Format Not Detected
+
+The server auto-detects:
+- `.gguf` extension → GGUF format
+- Directory with `model.safetensors` or `pytorch_model.bin` → Safetensors
+
+If auto-detection fails, check the path exists and contains expected files.
+
+### Connection Issues
+
+- Keep the server running (don't close notebook/terminal)
+- ngrok free tier has 2-hour session limits
+- Check firewall settings
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    VisionTracker (Local)                    │
-│  ┌──────────┐    ┌─────────────────────────────────────┐   │
-│  │ Detector │───▶│ GemmaRemoteService (gemma_remote_   │   │
-│  │  YOLOv8  │    │ service.py)                         │   │
-│  └──────────┘    │  - Batch crops (up to 16)           │   │
-│                  │  - HTTP POST to remote server       │   │
-│                  │  - No rate limiting (user control)  │   │
-│                  │  - Retry with backoff               │   │
-│                  └──────────┬──────────────────────────┘   │
-│                             │ HTTPS + ngrok tunnel         │
-│                             ▼                              │
-│                  ┌─────────────────────┐                   │
-│                  │  ngrok Cloud        │                   │
-│                  │  (tunnel broker)    │                   │
-│                  └──────────┬──────────┘                   │
-│                             │                              │
-└─────────────────────────────┼──────────────────────────────┘
-                              │
-                              ▼
+│  ┌──────────┐    ┌──────────┐    ┌─────────────────────┐   │
+│  │  Edge    │───▶│ Tracker  │───▶│ IDService           │   │
+│  │ Detector │    │          │    │  - Draw colored boxes│   │
+│  └──────────┘    └──────────┘    │  - POST to server   │   │
+│                                   └──────────┬──────────┘   │
+│                                              │ HTTPS        │
+└──────────────────────────────────────────────┼──────────────┘
+                                               │
+                                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Remote Server (Colab/Kaggle)                   │
-│  ┌──────────┐    ┌──────────┐    ┌──────────────────────┐  │
-│  │  FastAPI │───▶│  Llama   │───▶│ Gemma 3 4B (GGUF)    │  │
-│  │  Server  │    │  CPP     │    │ Q4_K_M quantized     │  │
-│  │  :8000   │    │  Python  │    │ ~3.3GB, T4 GPU       │  │
-│  └──────────┘    └──────────┘    └──────────────────────┘  │
+│              Remote Server (Your Hardware)                  │
+│  ┌──────────┐    ┌──────────────────────────────────────┐  │
+│  │  FastAPI │───▶│  LLM (GGUF or Safetensors)           │  │
+│  │  Server  │    │  - Vision encoder                    │  │
+│  │  :8000   │    │  - Prompt: "Identify by color"       │  │
+│  └──────────┘    │  - Response: {1:"person",2:"car"}    │  │
+│                  └──────────────────────────────────────┘  │
 │                                                             │
 │  Endpoints:                                                 │
 │    GET /health   - Health check                             │
-│    POST /identify - Batch object identification             │
+│    POST /identify - Identify objects by colored boxes       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Files
+## Prompt Engineering
 
-- `colab_setup.ipynb` - Google Colab notebook
-- `kaggle_setup.ipynb` - Kaggle notebook
-- `requirements.txt` - Python dependencies
-- `README.md` - This file
+The server uses carefully engineered prompts to get single common noun responses:
 
-## Performance Comparison
+```
+You see N colored boxes on objects in an image.
+The colors and their object numbers are: red (object #1), blue (object #2), ...
 
-| Setup | Batch Size | Time per Batch | Effective IDs/min |
-|-------|-----------|----------------|-------------------|
-| OpenRouter Free | 4 | 5-15s | ~50 |
-| Colab T4 | 4 | 2-5s | ~150 |
-| Kaggle T4 | 8 | 3-6s | ~300 |
-| Kaggle P100 | 8 | 2-4s | ~400 |
+Identify each object with exactly ONE common noun.
+Use simple everyday words like: person, car, dog, chair, table, etc.
 
-## Contributing
+Respond in this exact format (one per line):
+1. [common noun for the red box]
+2. [common noun for the blue box]
+...
+```
 
-The server implementation is in the notebook cells. To modify:
+This produces responses like:
+- `1. person`
+- `2. car`
+- `3. dog`
 
-1. Edit the notebook cell containing the FastAPI app
-2. Test locally with `uvicorn main:app --reload`
-3. Export updated `.ipynb` to this directory
+## Performance
+
+| Setup | Format | Batch Size | Time per Request |
+|-------|--------|------------|------------------|
+| Colab T4 | GGUF Q4_K_M | 4 | 2-4s |
+| Colab T4 | GGUF Q4_K_M | 8 | 4-6s |
+| Kaggle P100 | GGUF Q4_K_M | 8 | 2-3s |
+| Kaggle P100 | Safetensors | 4 | 3-5s |
 
 ## License
 
-Same as VisionTracker project. Model weights subject to Google's Gemma license.
+Same as VisionTracker project. Model weights subject to their respective licenses (Gemma, Phi, etc.).

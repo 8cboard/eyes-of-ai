@@ -1,58 +1,30 @@
 """
-id_service.py — OpenRouter Vision-LLM Identification Service (Nemotron Nano 12B VL)
+id_service.py — Remote LLM Identification Service (Annotated Frame Mode)
 
-Backend: OpenRouter free tier → nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free
-         (OpenAI-compatible API, no billing required — free model, free account)
+Sends full annotated frames (not crops) to a remote LLM server for identification.
+The LLM receives a frame with colored bounding boxes and returns a single common
+noun describing each object based on its color.
 
-Obtain a free API key at: https://openrouter.ai  (no credit card needed for :free models)
-Set via:  export OPENROUTER_API_KEY=sk-or-v1-...
-  or pass --openrouter-key on the CLI.
+Architecture:
+  - Local: Edge detection → Tracking → Draw colored boxes → Send annotated frame
+  - Remote: LLM identifies objects by color → Returns {track_id: noun}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  RATE LIMIT STRATEGY  (the hard problem with free endpoints)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-OpenRouter free models allow ~20 requests/minute (RPM).
-A naive 1-request-per-object strategy with 5+ objects on screen
-would exhaust that in seconds.  Three-layer defence:
-
-  Layer 1 — Batch dispatch (multiplies throughput × N per request)
-    ┌─────────────────────────────────────────────────────────┐
-    │  Up to BATCH_SIZE (default 4) crops are packed into a   │
-    │  SINGLE OpenRouter call with N images in one message.   │
-    │  The model returns one description per image.           │
-    │  → 1 API hit identifies up to 4 objects.                │
-    │  At 13 RPM × batch 4 = ~52 effective IDs/min.           │
-    └─────────────────────────────────────────────────────────┘
-
-  Layer 2 — Token-bucket rate limiter
-    A background thread owns the HTTP client exclusively.
-    Before every request it acquires a token from a bucket
-    refilling at REFILL_RATE (default 0.22 tok/s = 13.2 RPM,
-    safely under the 20 RPM limit).  Burst capacity = 3 tokens.
-
-  Layer 3 — Adaptive 429 back-off + re-queue
-    HTTP 429 → sleep Retry-After seconds, return items to the
-    front of the priority queue, and retry.  No items are lost.
-
-  Plus — TTL cache + stillness gating (enforced in main.py)
-    Objects only submitted when still AND cache expired,
-    so static background objects are never re-submitted.
-
-Progress dict format (shared with ui_overlay.py):
+API Endpoint (remote server):
+  POST /identify
   {
-    track_id (int): {
-        "status":   "idle" | "queued" | "identifying" | "done" | "error",
-        "progress": float 0.0 – 1.0,
-        "label":    str | None,
-        "error":    str | None,
-    }
+    "annotated_image": "base64_jpeg",
+    "color_map": {"red": 1, "blue": 2, "green": 3, ...}
+  }
+  
+  Response:
+  {
+    "results": [
+      {"track_id": 1, "description": "person"},
+      {"track_id": 2, "description": "car"}
+    ]
   }
 
-Privacy:
-  Crops sent as base64 JPEG to https://openrouter.ai/api/v1.
-  Do not use with sensitive footage.
-  OpenRouter privacy policy: https://openrouter.ai/privacy
+Prompt engineering ensures single common noun responses (person, car, dog, chair, etc.)
 """
 
 from __future__ import annotations
@@ -62,7 +34,6 @@ import json
 import logging
 import os
 import queue
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -80,123 +51,76 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("id_service")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration constants (all overridable in IdentificationService.__init__)
-# ─────────────────────────────────────────────────────────────────────────────
-
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Free Nemotron Nano 12B Vision-Language model on OpenRouter.
-# Verify / update at: https://openrouter.ai/models?q=nemotron
-NEMOTRON_MODEL     = "nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free"
-
-# Rate limiting — stay safely under 20 RPM free limit
-REFILL_RATE        = 0.22    # tokens/second  →  13.2 requests/minute
-BUCKET_CAPACITY    = 3       # max burst (tokens)
-
-# Batching
-BATCH_SIZE         = 4       # max crops per single API call
-BATCH_WAIT_MS      = 1_500   # ms to wait collecting a fuller batch before firing
-
-# HTTP
-REQUEST_TIMEOUT_S  = 20      # seconds per API call
+# Configuration constants
+DEFAULT_REMOTE_URL = ""
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_BATCH_WAIT_MS = 1_000
+REQUEST_TIMEOUT_S = 60
+MAX_RETRIES = 3
+RETRY_BASE_DELAY_S = 2.0
 
 # Image encoding
-JPEG_QUALITY       = 72      # lower = smaller payload = faster
-MAX_CROP_PX        = 336     # longest-edge resize before encoding (model recommended)
+JPEG_QUALITY = 85
+MAX_FRAME_SIZE = 1280  # Longest edge for annotated frame
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data structures
-# ─────────────────────────────────────────────────────────────────────────────
+# Color palette must match ui_overlay.py exactly
+_COLOR_NAMES = [
+    "sky blue", "orange", "green", "pink", "blue", "vermillion",
+    "yellow", "teal", "red", "purple", "peach", "mint",
+    "lime", "light blue", "magenta", "light yellow", "cyan",
+    "olive", "dark cyan", "dark magenta"
+]
+
+_PALETTE = [
+    (86, 180, 233),   # sky blue
+    (230, 159, 0),    # orange
+    (0, 158, 115),    # green
+    (204, 121, 167),  # pink
+    (0, 114, 178),    # blue
+    (213, 94, 0),     # vermillion
+    (240, 228, 66),   # yellow
+    (0, 204, 153),    # teal
+    (255, 102, 102),  # red
+    (153, 102, 255),  # purple
+    (255, 178, 102),  # peach
+    (102, 255, 178),  # mint
+    (178, 255, 102),  # lime
+    (102, 178, 255),  # light blue
+    (255, 102, 178),  # magenta
+    (255, 255, 102),  # light yellow
+    (102, 255, 255),  # cyan
+    (204, 204, 0),    # olive
+    (0, 204, 204),    # dark cyan
+    (204, 0, 204),    # dark magenta
+]
+
+
+def _color_name(track_id: int) -> str:
+    """Get the color name for a track_id (matches UI palette)."""
+    return _COLOR_NAMES[track_id % len(_COLOR_NAMES)]
+
+
+def _color_bgr(track_id: int) -> tuple[int, int, int]:
+    """Get the BGR color tuple for a track_id (matches UI palette)."""
+    return _PALETTE[track_id % len(_PALETTE)]
+
 
 @dataclass(order=True)
 class PendingItem:
-    """One crop awaiting identification.  Sortable by priority for the queue."""
-    priority:     float       = field()          # lower = served sooner (FIFO default)
-    track_id:     int         = field(compare=False)
-    crop:         np.ndarray  = field(compare=False)
-    class_name:   str         = field(compare=False)
-    class_id:     int         = field(compare=False)
+    """One frame awaiting identification."""
+    priority:     float       = field()
+    track_ids:    list[int]   = field(compare=False)
+    frame:        np.ndarray  = field(compare=False)
     submitted_at: float       = field(compare=False, default_factory=time.monotonic)
 
 
-class RateLimitError(Exception):
-    """Raised when OpenRouter returns HTTP 429."""
-    def __init__(self, retry_after: float = 30.0) -> None:
-        super().__init__(f"Rate limited — retry after {retry_after:.0f}s")
-        self.retry_after = retry_after
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Token-bucket rate limiter
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TokenBucket:
-    """Thread-safe leaky/token bucket for HTTP rate limiting.
-
-    Tokens refill continuously at ``rate`` tokens/second up to ``capacity``.
-    ``acquire()`` blocks until a token is available.
-
-    Parameters
-    ----------
-    rate : float
-        Refill rate in tokens per second.
-    capacity : float
-        Maximum bucket size (burst limit).
-    """
-
-    def __init__(self, rate: float = REFILL_RATE, capacity: float = BUCKET_CAPACITY) -> None:
-        self._rate        = rate
-        self._capacity    = float(capacity)
-        self._tokens      = float(capacity)
-        self._last_refill = time.monotonic()
-        self._lock        = threading.Lock()
-
-    def acquire(self, n: float = 1.0) -> None:
-        """Block until n tokens are available, then consume them."""
-        while True:
-            with self._lock:
-                self._refill()
-                if self._tokens >= n:
-                    self._tokens -= n
-                    return
-            # Sleep until approximately one token is ready
-            wait = (n - self._tokens) / self._rate
-            time.sleep(min(wait, 0.5))
-
-    def peek(self) -> float:
-        """Return current token count (approximate, for display)."""
-        with self._lock:
-            self._refill()
-            return round(self._tokens, 2)
-
-    def _refill(self) -> None:
-        """Add tokens for elapsed time (must be called under self._lock)."""
-        now    = time.monotonic()
-        added  = (now - self._last_refill) * self._rate
-        self._tokens      = min(self._capacity, self._tokens + added)
-        self._last_refill = now
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-track TTL cache
-# ─────────────────────────────────────────────────────────────────────────────
-
 class IdentificationCache:
-    """Thread-safe per-track label cache with configurable TTL.
-
-    Parameters
-    ----------
-    ttl_seconds : float
-        How long an identified label stays valid.  After expiry the track
-        becomes eligible for re-identification if it becomes still again.
-    """
+    """Thread-safe per-track label cache with configurable TTL."""
 
     def __init__(self, ttl_seconds: float = 45.0) -> None:
-        self._ttl   = ttl_seconds
-        self._lock  = threading.Lock()
-        # {track_id: (label, inserted_at)}
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
         self._store: dict[int, tuple[str, float]] = {}
 
     def get(self, track_id: int) -> Optional[str]:
@@ -229,173 +153,195 @@ class IdentificationCache:
         return len(stale)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenRouter HTTP client
-# ─────────────────────────────────────────────────────────────────────────────
+class RemoteLLMClient:
+    """HTTP client for the remote LLM identification server.
 
-class OpenRouterClient:
-    """Thin OpenAI-compatible client targeting OpenRouter/Nemotron vision.
-
-    Supports multi-image batching: up to BATCH_SIZE base64 crops in one call.
-
-    Free key signup: https://openrouter.ai  (no credit card for :free models)
-
-    Example CLI equivalent (single crop, no auth required for free models):
-        curl -X POST https://openrouter.ai/api/v1/chat/completions \\
-          -H "Authorization: Bearer $OPENROUTER_API_KEY" \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "model": "nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free",
-            "messages": [{
-              "role": "user",
-              "content": [
-                {"type":"text","text":"Describe this object in one sentence."},
-                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,<B64>"}}
-              ]
-            }],
-            "max_tokens": 80
-          }'
+    Parameters
+    ----------
+    base_url : str
+        The public URL of the remote server
+    api_key : str, optional
+        Optional API key for server authentication
+    timeout : float
+        Request timeout in seconds
     """
 
     def __init__(
         self,
-        api_key:  str,
-        model:    str   = NEMOTRON_MODEL,
-        timeout:  float = REQUEST_TIMEOUT_S,
+        base_url: str,
+        api_key: Optional[str] = None,
+        timeout: float = REQUEST_TIMEOUT_S,
     ) -> None:
-        if not api_key:
+        if not base_url:
             raise ValueError(
-                "OpenRouter API key is required (it's free).\n"
-                "  1. Go to https://openrouter.ai and create a free account.\n"
-                "  2. Generate a key (no credit card needed for :free models).\n"
-                "  3. export OPENROUTER_API_KEY=sk-or-v1-...\n"
-                "     or use --openrouter-key on the CLI."
+                "Remote server URL is required.\n"
+                "  1. Run the remote server (see remote_server/README.md)\n"
+                "  2. Copy the public URL\n"
+                "  3. python main.py --remote-url https://xxx.ngrok.io"
             )
         if not _REQ_OK:
             raise ImportError("pip install requests")
 
-        self._model   = model
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
         self._timeout = timeout
         self._session = _req.Session()
-        self._session.headers.update({
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
-            "HTTP-Referer":  "https://github.com/visiontracker",   # polite routing hint
-            "X-Title":       "VisionTracker",
-        })
 
-    def identify_batch(self, items: list[PendingItem]) -> dict[int, str]:
-        """Identify up to BATCH_SIZE objects in a single API call.
+        # Health check on init
+        self._check_health()
 
-        Packs all crops as image_url content blocks in one user message.
-        Asks the model to respond with a numbered list (one line per image).
+    def _check_health(self) -> None:
+        """Verify server is reachable and healthy."""
+        try:
+            resp = self._session.get(
+                f"{self._base_url}/health",
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"[IDService] Connected to server: {data.get('model', 'unknown')}")
+        except Exception as exc:
+            print(f"[IDService] Health check warning: {exc}")
+            print(f"[IDService] Server may still be starting up...")
+
+    def _headers(self) -> dict[str, str]:
+        """Build request headers with optional auth."""
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
+
+    def identify_frame(
+        self,
+        frame: np.ndarray,
+        track_ids: list[int]
+    ) -> dict[int, str]:
+        """Identify objects in an annotated frame.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            Annotated frame with colored bounding boxes
+        track_ids : list[int]
+            List of track IDs present in the frame
 
         Returns
         -------
         dict[int, str]
-            {track_id: description_string} for every item.
-            Falls back to item.class_name on any parse failure.
+            {track_id: description_string} for each track
         """
-        n       = len(items)
-        content = _build_message_content(items)
+        # Encode frame to base64 JPEG
+        img_b64 = _encode_frame(frame)
+
+        # Build color map
+        color_map = {_color_name(tid): tid for tid in track_ids}
 
         payload = {
-            "model":       self._model,
-            "messages":    [{"role": "user", "content": content}],
-            "max_tokens":  100 * n,   # ~10 words × ~10 tokens × n objects
-            "temperature": 0.2,       # low = consistent, factual descriptions
+            "annotated_image": img_b64,
+            "color_map": color_map,
         }
 
-        resp = self._session.post(
-            OPENROUTER_API_URL,
-            data=json.dumps(payload),
-            timeout=self._timeout,
-        )
+        last_exception: Optional[Exception] = None
 
-        if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", 30))
-            raise RateLimitError(retry_after)
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = self._session.post(
+                    f"{self._base_url}/identify",
+                    headers=self._headers(),
+                    data=json.dumps(payload),
+                    timeout=self._timeout,
+                )
+                resp.raise_for_status()
 
-        resp.raise_for_status()
+                data = resp.json()
+                results = {}
+                for result in data.get("results", []):
+                    tid = result.get("track_id")
+                    desc = result.get("description", "")
+                    if tid is not None:
+                        results[tid] = desc
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        log.debug("Raw model output: %r", raw)
-        return _parse_batch_response(raw, items)
+                # Fill in any missing results with "object"
+                for tid in track_ids:
+                    if tid not in results:
+                        results[tid] = "object"
 
+                return results
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main service — single dispatcher, batching, rate limiting
-# ─────────────────────────────────────────────────────────────────────────────
+            except _req.exceptions.RequestException as exc:
+                last_exception = exc
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+                    print(f"[IDService] Request failed (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                else:
+                    break
+
+        raise last_exception or RuntimeError("Unknown error in identify_frame")
+
 
 class IdentificationService:
-    """Non-blocking multi-object identification using OpenRouter Nemotron VL.
+    """Non-blocking identification using remote LLM with annotated frames.
 
-    One background thread (*dispatcher*) owns all HTTP traffic.
-    The main thread calls ``submit()`` which puts items into a
-    ``PriorityQueue``.  The dispatcher assembles batches, throttles via
-    ``TokenBucket``, fires batched API calls, and writes results into
-    the shared ``progress`` dict.
+    One background thread owns all HTTP traffic.
+    The main thread calls ``submit()`` with an annotated frame.
+    The dispatcher sends frames to the remote LLM server.
 
     Parameters
     ----------
-    api_key : str
-        OpenRouter API key.  Falls back to OPENROUTER_API_KEY env var.
-    model : str
-        Model slug on OpenRouter.
+    remote_url : str
+        The public URL of the remote server
+    api_key : str, optional
+        Optional API key for server authentication
     cache_ttl : float
         Seconds a cached result stays valid.
     batch_size : int
-        Max crops per API call (1–4 recommended; larger = more latency).
+        Max track IDs per API call.
     batch_wait_ms : int
         How long (ms) the dispatcher waits for a fuller batch.
-        Higher = fewer requests but slightly more ID latency.
-        For ≤10 s total ID time: keep at 1500–2000 ms.
     """
 
     def __init__(
         self,
-        api_key:      str   = "",
-        model:        str   = NEMOTRON_MODEL,
-        cache_ttl:    float = 45.0,
-        batch_size:   int   = BATCH_SIZE,
-        batch_wait_ms: int  = BATCH_WAIT_MS,
+        remote_url: str = "",
+        api_key: Optional[str] = None,
+        cache_ttl: float = 45.0,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_wait_ms: int = DEFAULT_BATCH_WAIT_MS,
     ) -> None:
-        api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._client     = OpenRouterClient(api_key=api_key, model=model)
-        self._bucket     = TokenBucket(rate=REFILL_RATE, capacity=BUCKET_CAPACITY)
-        self._cache      = IdentificationCache(ttl_seconds=cache_ttl)
-        self._batch_sz   = max(1, min(batch_size, 8))
-        self._batch_wait = batch_wait_ms / 1_000.0  # ms → s
+        remote_url = remote_url or os.environ.get("REMOTE_URL", "")
+        api_key = api_key or os.environ.get("REMOTE_API_KEY")
 
-        # Shared progress dict — read by ui_overlay at frame rate
+        self._client = RemoteLLMClient(base_url=remote_url, api_key=api_key)
+        self._cache = IdentificationCache(ttl_seconds=cache_ttl)
+        self._batch_sz = max(1, min(batch_size, 16))
+        self._batch_wait = batch_wait_ms / 1_000.0
+
+        # Shared progress dict
         self.progress: dict[int, dict] = {}
-        self._prog_lock  = threading.Lock()
+        self._prog_lock = threading.Lock()
 
-        # Priority queue (smallest priority value dispatched first)
+        # Priority queue
         self._q: queue.PriorityQueue[PendingItem] = queue.PriorityQueue()
 
         # Track which track_ids are currently queued or in-flight
         self._inflight: set[int] = set()
-        self._ifl_lock  = threading.Lock()
+        self._ifl_lock = threading.Lock()
 
-        # Counters for debugging / UI
-        self.stats = dict(requests=0, identified=0, rate_limit_hits=0, errors=0)
+        # Counters
+        self.stats = dict(requests=0, identified=0, errors=0, retries=0)
 
-        # Start the single dispatcher thread
+        # Start dispatcher thread
         self._alive = True
         self._thread = threading.Thread(
             target=self._dispatch_loop, name="id-dispatcher", daemon=True
         )
         self._thread.start()
 
-        eff = REFILL_RATE * self._batch_sz * 60
-        print(f"[IDService] OpenRouter / {model}")
-        print(f"[IDService] Rate limiter: {REFILL_RATE:.2f} tok/s "
-              f"(~{REFILL_RATE*60:.0f} RPM) × batch {self._batch_sz} "
-              f"= ~{eff:.0f} effective IDs/min")
-        print(f"[IDService] Cache TTL: {cache_ttl}s | Batch wait: {batch_wait_ms}ms")
-
-    # ── Public API ─────────────────────────────────────────────────────────────
+        print(f"[IDService] Remote LLM identification")
+        print(f"[IDService] Server: {remote_url}")
+        print(f"[IDService] Batch size: {self._batch_sz} | Batch wait: {batch_wait_ms}ms")
+        print(f"[IDService] Cache TTL: {cache_ttl}s")
 
     def get_cached(self, track_id: int) -> Optional[str]:
         """Return cached label or None if not yet identified / expired."""
@@ -403,44 +349,42 @@ class IdentificationService:
 
     def submit(
         self,
-        track_id:   int,
-        crop:       np.ndarray,
-        class_name: str,
-        class_id:   int,
-        priority:   Optional[float] = None,
+        track_ids: list[int],
+        annotated_frame: np.ndarray,
+        priority: Optional[float] = None,
     ) -> bool:
-        """Enqueue *crop* for background identification.
+        """Enqueue an annotated frame for background identification.
 
-        Returns True if enqueued, False if already in-flight or cached.
-        Pass a lower *priority* value to jump ahead in the queue.
+        Returns True if enqueued, False if all tracks already in-flight or cached.
         """
-        if self._cache.get(track_id) is not None:
-            return False
+        # Filter out cached and in-flight tracks
+        new_tracks = []
         with self._ifl_lock:
-            if track_id in self._inflight:
-                return False
-            self._inflight.add(track_id)
+            for tid in track_ids:
+                if self._cache.get(tid) is None and tid not in self._inflight:
+                    new_tracks.append(tid)
+                    self._inflight.add(tid)
+
+        if not new_tracks:
+            return False
 
         item = PendingItem(
-            priority   = priority if priority is not None else time.monotonic(),
-            track_id   = track_id,
-            crop       = crop.copy(),
-            class_name = class_name,
-            class_id   = class_id,
+            priority=priority if priority is not None else time.monotonic(),
+            track_ids=new_tracks,
+            frame=annotated_frame.copy(),
         )
         self._q.put(item)
-        self._set_prog(track_id, "queued", 0.0)
+
+        for tid in new_tracks:
+            self._set_prog(tid, "queued", 0.0)
+
         return True
 
     def queue_depth(self) -> int:
         return self._q.qsize()
 
-    def bucket_tokens(self) -> float:
-        """Current token bucket level (0.0 – BUCKET_CAPACITY). For HUD display."""
-        return self._bucket.peek()
-
     def inject_cached(self, track_id: int) -> None:
-        """Push a cached label into progress dict (called from main loop)."""
+        """Push a cached label into progress dict."""
         label = self._cache.get(track_id)
         if label is not None:
             self._set_prog(track_id, "done", 1.0, label=label)
@@ -448,34 +392,30 @@ class IdentificationService:
     def shutdown(self) -> None:
         """Stop the dispatcher thread gracefully."""
         self._alive = False
-        # Sentinel item to unblock queue.get()
         self._q.put(PendingItem(
-            priority=float("inf"), track_id=-1,
-            crop=np.zeros((1, 1, 3), np.uint8),
-            class_name="__stop__", class_id=-1,
+            priority=float("inf"), track_ids=[],
+            frame=np.zeros((1, 1, 3), np.uint8),
         ))
         self._thread.join(timeout=3.0)
 
-    # ── Dispatcher (background thread — single, serialised) ────────────────────
-
     def _dispatch_loop(self) -> None:
-        """Collect batches from the queue and send to OpenRouter."""
+        """Collect batches from the queue and send to remote server."""
         while self._alive:
-            # Block until at least one item arrives
             try:
                 first = self._q.get(timeout=1.0)
             except queue.Empty:
-                self._cache.evict_expired()   # housekeeping while idle
+                self._cache.evict_expired()
                 continue
 
-            if first.track_id == -1:          # stop sentinel
+            if not first.track_ids:  # stop sentinel
                 break
 
             batch: list[PendingItem] = [first]
+            all_track_ids = set(first.track_ids)
 
-            # ── Fill batch (wait up to batch_wait for more items) ─────────
+            # Fill batch
             deadline = time.monotonic() + self._batch_wait
-            while len(batch) < self._batch_sz:
+            while len(all_track_ids) < self._batch_sz:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
@@ -484,195 +424,101 @@ class IdentificationService:
                 except queue.Empty:
                     break
 
-                if item.track_id == -1:
+                if not item.track_ids:
                     self._alive = False
                     break
 
-                # Skip if already identified while we were waiting
-                if self._cache.get(item.track_id) is not None:
-                    self._set_prog(item.track_id, "done", 1.0,
-                                   label=self._cache.get(item.track_id))
-                    with self._ifl_lock:
-                        self._inflight.discard(item.track_id)
-                    continue
+                # Skip if already identified
+                skip = False
+                for tid in item.track_ids:
+                    if self._cache.get(tid) is not None:
+                        self._set_prog(tid, "done", 1.0, label=self._cache.get(tid))
+                        with self._ifl_lock:
+                            self._inflight.discard(tid)
+                    elif tid in all_track_ids:
+                        skip = True
+                    else:
+                        all_track_ids.add(tid)
 
-                batch.append(item)
+                if not skip:
+                    batch.append(item)
 
             if not batch:
                 continue
 
-            for item in batch:
-                self._set_prog(item.track_id, "identifying", 0.2)
+            for tid in all_track_ids:
+                self._set_prog(tid, "identifying", 0.2)
 
-            # ── Rate-limit: block until token available ───────────────────
-            log.debug("Bucket level: %.2f — waiting for token…", self._bucket.peek())
-            self._bucket.acquire()            # may block up to a few seconds
+            # Use the most recent frame for identification
+            latest_frame = max(batch, key=lambda x: x.submitted_at).frame
 
-            # ── Fire batch ────────────────────────────────────────────────
-            self._fire(batch)
+            self._fire(latest_frame, list(all_track_ids))
 
-    def _fire(self, batch: list[PendingItem]) -> None:
-        """Execute one batched API call and distribute results."""
-        for item in batch:
-            self._set_prog(item.track_id, "identifying", 0.5)
+    def _fire(self, frame: np.ndarray, track_ids: list[int]) -> None:
+        """Execute API call and distribute results."""
+        for tid in track_ids:
+            self._set_prog(tid, "identifying", 0.5)
 
         try:
             self.stats["requests"] += 1
-            results = self._client.identify_batch(batch)
+            results = self._client.identify_frame(frame, track_ids)
 
-            for item in batch:
-                label = results.get(item.track_id, item.class_name)
-                self._cache.set(item.track_id, label)
-                self._set_prog(item.track_id, "done", 1.0, label=label)
+            for tid in track_ids:
+                label = results.get(tid, "object")
+                self._cache.set(tid, label)
+                self._set_prog(tid, "done", 1.0, label=label)
                 self.stats["identified"] += 1
-                print(f"[IDService] ✓ #{item.track_id} ({item.class_name}) "
-                      f"→ \"{_trunc(label, 60)}\"")
+                print(f"[IDService] ✓ #{tid} → \"{label}\"")
 
-        except RateLimitError as exc:
-            self.stats["rate_limit_hits"] += 1
-            wait = exc.retry_after
-            print(f"[IDService] ⚠️  Rate limit — sleeping {wait:.0f}s, re-queuing {len(batch)} items")
-            for item in batch:
-                self._set_prog(item.track_id, "queued", 0.05,
-                               label=f"Rate limited — retrying in {wait:.0f}s…")
-            time.sleep(wait)
-            # Re-queue at front (negative priority = highest priority)
-            for item in batch:
-                item.priority = time.monotonic() - 1_000
-                self._q.put(item)
-            return  # keep inflight — items re-queued
-
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.stats["errors"] += 1
             msg = _trunc(str(exc), 80)
             print(f"[IDService] ✗ Error: {msg}")
-            for item in batch:
-                self._cache.set(item.track_id, item.class_name)
-                self._set_prog(item.track_id, "error", 1.0,
-                               label=item.class_name, error=msg)
+            for tid in track_ids:
+                self._cache.set(tid, "object")
+                self._set_prog(tid, "error", 1.0, label="object", error=msg)
 
         finally:
             with self._ifl_lock:
-                for item in batch:
-                    self._inflight.discard(item.track_id)
-
-    # ── Internal ───────────────────────────────────────────────────────────────
+                for tid in track_ids:
+                    self._inflight.discard(tid)
 
     def _set_prog(
         self,
         track_id: int,
-        status:   str,
+        status: str,
         progress: float,
-        label:    Optional[str] = None,
-        error:    Optional[str] = None,
+        label: Optional[str] = None,
+        error: Optional[str] = None,
     ) -> None:
         with self._prog_lock:
             prev = self.progress.get(track_id, {})
             self.progress[track_id] = {
-                "status":   status,
+                "status": status,
                 "progress": progress,
-                "label":    label if label is not None else prev.get("label"),
-                "error":    error,
+                "label": label if label is not None else prev.get("label"),
+                "error": error,
             }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Message construction helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_message_content(items: list[PendingItem]) -> list[dict]:
-    """Build the OpenAI-compatible multimodal content list for a batch."""
-    n = len(items)
-    if n == 1:
-        prompt = (
-            f"The object detector classified this crop as '{items[0].class_name}'. "
-            "Describe it in ONE concise sentence (≤ 12 words): colour, shape, key features."
-        )
-    else:
-        numbered = "\n".join(f"{i+1}. <description>" for i in range(n))
-        prompt = (
-            f"I will show you {n} object crops from a video frame. "
-            "The detector classes are shown before each image.\n"
-            "Write ONE short sentence per object (≤ 12 words: colour, shape, features).\n"
-            f"Reply ONLY in this exact format:\n{numbered}"
-        )
-
-    content: list[dict] = [{"type": "text", "text": prompt}]
-
-    for i, item in enumerate(items):
-        if n > 1:
-            content.append({
-                "type": "text",
-                "text": f"Image {i + 1} — detected class: {item.class_name}",
-            })
-        b64 = _encode_crop(item.crop)
-        content.append({
-            "type":      "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-        })
-
-    return content
-
-
-def _encode_crop(
-    crop: np.ndarray,
-    max_px:  int = MAX_CROP_PX,
+def _encode_frame(
+    frame: np.ndarray,
+    max_px: int = MAX_FRAME_SIZE,
     quality: int = JPEG_QUALITY,
 ) -> str:
-    """Resize and JPEG-encode a crop, return base64 string."""
-    h, w = crop.shape[:2]
+    """Resize and JPEG-encode a frame, return base64 string."""
+    h, w = frame.shape[:2]
     if max(h, w) > max_px:
         scale = max_px / max(h, w)
-        crop = cv2.resize(
-            crop,
+        frame = cv2.resize(
+            frame,
             (max(1, int(w * scale)), max(1, int(h * scale))),
             interpolation=cv2.INTER_AREA,
         )
-    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return base64.b64encode(buf.tobytes()).decode("utf-8")
-
-
-def _parse_batch_response(text: str, items: list[PendingItem]) -> dict[int, str]:
-    """Parse model's numbered-list reply into {track_id: description}.
-
-    Expected format (n > 1):
-        1. A red ceramic mug with a curved handle
-        2. A silver MacBook with stickers on the lid
-        ...
-
-    Falls back gracefully if the model doesn't follow the format exactly.
-    """
-    n = len(items)
-    results: dict[int, str] = {}
-
-    if n == 1:
-        clean = re.sub(r"^1[.)]\s*", "", text.strip()).strip()
-        results[items[0].track_id] = clean or items[0].class_name
-        return results
-
-    # Try numbered list pattern
-    numbered: dict[int, str] = {}
-    pattern = re.compile(r"^\s*(\d+)[.)]\s*(.+)$")
-    for line in text.splitlines():
-        m = pattern.match(line)
-        if m:
-            idx = int(m.group(1)) - 1
-            if 0 <= idx < n:
-                numbered[idx] = m.group(2).strip()
-
-    for i, item in enumerate(items):
-        if i in numbered:
-            results[item.track_id] = numbered[i]
-        else:
-            # Heuristic fallback: grab non-empty lines in order
-            fallback_lines = [l.strip() for l in text.splitlines() if l.strip()]
-            results[item.track_id] = (
-                fallback_lines[i] if i < len(fallback_lines) else item.class_name
-            )
-
-    return results
 
 
 def _trunc(s: str, n: int) -> str:

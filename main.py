@@ -2,12 +2,11 @@
 main.py — VisionTracker entry point.
 
 Orchestrates the full pipeline:
-  Camera → Detector → Tracker → StillnessDetector → IDService → UIOverlay
+  Camera → EdgeDetector → Tracker → Draw Annotated Frame → IDService → UIOverlay
 
 Run:
-  python main.py --mode local --backend blip
-  python main.py --mode hybrid                  # HuggingFace free API
-  python main.py --mode local --backend ollama  # requires: ollama serve
+  python main.py --remote-url https://xxx.ngrok.io
+  python main.py --remote-url https://xxx.ngrok.io --use-bg-removal
 
 See README.md for full flag documentation and performance notes.
 """
@@ -30,7 +29,7 @@ import numpy as np
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="VisionTracker — real-time detection, tracking, and LLM identification",
+        description="VisionTracker — real-time edge detection, tracking, and LLM identification",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Input
@@ -39,60 +38,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=1280, help="Capture width in pixels")
     p.add_argument("--height", type=int, default=720, help="Capture height in pixels")
     p.add_argument("--grayscale", action="store_true",
-                   help="Force grayscale (faster on CPU; detection still uses BGR internally)")
+                   help="Force grayscale (faster on CPU)")
 
-    # Detector
-    p.add_argument("--detector", default="yolov8n.pt",
-                   choices=["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8x.pt"],
-                   help="YOLOv8 model size")
-    p.add_argument("--skip-frames", type=int, default=2,
+    # Edge Detector
+    p.add_argument("--edge-min-area", type=int, default=500,
+                   help="Minimum contour area to detect as object")
+    p.add_argument("--edge-max-area", type=int, default=100000,
+                   help="Maximum contour area (filters huge regions)")
+    p.add_argument("--canny-low", type=int, default=50,
+                   help="Canny edge detector low threshold")
+    p.add_argument("--canny-high", type=int, default=150,
+                   help="Canny edge detector high threshold")
+    p.add_argument("--use-bg-removal", action="store_true",
+                   help="Use background removal before edge detection (requires rembg)")
+    p.add_argument("--skip-frames", type=int, default=1,
                    help="Run detector every N frames (1=every frame)")
-    p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
-    p.add_argument("--imgsz", type=int, default=640,
-                   help="Detector input size (320=faster, 640=default, 1280=accurate)")
-    p.add_argument("--device", default=None,
-                   help="Compute device: cpu, cuda, mps (default: auto-detect)")
 
     # Tracker
     p.add_argument("--tracker", default="bytetrack", choices=["bytetrack", "centroid"],
                    help="Tracker type (centroid is faster on very slow CPUs)")
 
-    # Stillness
-    p.add_argument("--still-frames", type=int, default=10,
-                   help="M: consecutive below-threshold frames to trigger ID")
-    p.add_argument("--still-window", type=int, default=15,
-                   help="N: centroid/IoU history window length")
-    p.add_argument("--velocity-thresh", type=float, default=5.0,
-                   help="Max centroid pixel velocity (px/frame) to count as still")
-    p.add_argument("--iou-thresh", type=float, default=0.85,
-                   help="Min consecutive IoU to count as geometrically stable")
-    p.add_argument("--optical-flow", action="store_true",
-                   help="Use optical-flow stillness detector (for moving cameras)")
-
-    # ID Service — OpenRouter / Nemotron Nano 12B VL
-    p.add_argument("--openrouter-key", default=None,
-                   help="OpenRouter API key (free). "
-                        "Obtain at https://openrouter.ai — no credit card needed for :free models. "
-                        "Can also be set via OPENROUTER_API_KEY env var.")
-    p.add_argument("--model", default=None,
-                   help="OpenRouter model slug (default: nvidia/llama-3.1-nemotron-nano-12b-vl-instruct:free)")
+    # ID Service
+    p.add_argument("--remote-url", default=None,
+                   help="Remote LLM server URL (e.g., https://xxx.ngrok.io). "
+                        "Can also be set via REMOTE_URL env var.")
+    p.add_argument("--remote-key", default=None,
+                   help="Optional API key for remote server. "
+                        "Can also be set via REMOTE_API_KEY env var.")
     p.add_argument("--id-ttl", type=float, default=45.0,
                    help="Seconds before re-identification of a cached track")
-    p.add_argument("--batch-size", type=int, default=4,
-                   help="Max crops per OpenRouter API call (1–4). "
-                        "Higher = fewer requests but slightly more latency.")
-    p.add_argument("--batch-wait", type=int, default=1500,
-                   help="ms to wait for a fuller batch before dispatching (default 1500)")
-
-    # ID Service — Self-hosted Gemma 3 4B Remote Server
-    p.add_argument("--use-remote-gemma", action="store_true",
-                   help="Use self-hosted Gemma 3 4B on Colab/Kaggle instead of OpenRouter")
-    p.add_argument("--remote-gemma-url", default=None,
-                   help="URL of the remote Gemma server (e.g., https://xxx.ngrok.io). "
-                        "Can also be set via REMOTE_GEMMA_URL env var.")
-    p.add_argument("--remote-gemma-key", default=None,
-                   help="Optional API key for remote server authentication. "
-                        "Can also be set via REMOTE_GEMMA_KEY env var.")
+    p.add_argument("--id-interval", type=float, default=5.0,
+                   help="Seconds between identification attempts for each track")
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Max tracks per API call")
+    p.add_argument("--batch-wait", type=int, default=1000,
+                   help="ms to wait for a fuller batch before dispatching")
 
     # UI
     p.add_argument("--show-velocity", action="store_true",
@@ -132,97 +112,112 @@ class FPSCounter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Crop helper
+# Color palette (must match ui_overlay.py and id_service.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def crop_object(frame: np.ndarray, xyxy: np.ndarray, pad: int = 10) -> np.ndarray:
-    """Crop and return the object region from *frame* with optional padding."""
-    h, w = frame.shape[:2]
-    x1 = max(0, int(xyxy[0]) - pad)
-    y1 = max(0, int(xyxy[1]) - pad)
-    x2 = min(w, int(xyxy[2]) + pad)
-    y2 = min(h, int(xyxy[3]) + pad)
-    return frame[y1:y2, x1:x2].copy()
+_PALETTE = [
+    (86, 180, 233),   # sky blue
+    (230, 159, 0),    # orange
+    (0, 158, 115),    # green
+    (204, 121, 167),  # pink
+    (0, 114, 178),    # blue
+    (213, 94, 0),     # vermillion
+    (240, 228, 66),   # yellow
+    (0, 204, 153),    # teal
+    (255, 102, 102),  # red
+    (153, 102, 255),  # purple
+    (255, 178, 102),  # peach
+    (102, 255, 178),  # mint
+    (178, 255, 102),  # lime
+    (102, 178, 255),  # light blue
+    (255, 102, 178),  # magenta
+    (255, 255, 102),  # light yellow
+    (102, 255, 255),  # cyan
+    (204, 204, 0),    # olive
+    (0, 204, 204),    # dark cyan
+    (204, 0, 204),    # dark magenta
+]
+
+
+def _color(track_id: int) -> tuple[int, int, int]:
+    return _PALETTE[track_id % len(_PALETTE)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Annotated frame drawer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_annotated_frame(
+    frame: np.ndarray,
+    tracked_objects: list,
+    box_thickness: int = 3,
+) -> np.ndarray:
+    """Draw colored bounding boxes on frame for LLM identification.
+
+    Each track gets a unique color that the LLM uses to identify objects.
+    """
+    annotated = frame.copy()
+
+    for obj in tracked_objects:
+        color = _color(obj.track_id)
+        x1, y1, x2, y2 = obj.xyxy.astype(int)
+
+        # Draw bounding box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, box_thickness)
+
+        # Draw small color indicator dot in corner
+        cv2.circle(annotated, (x1 + 8, y1 + 8), 6, color, -1)
+
+    return annotated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
+def main() -> int:
     args = parse_args()
 
-    # ── Imports (deferred to allow --help without torch) ─────────────────────
-    from detector import Detector
-    from stability import IoUVelocityStillnessDetector, OpticalFlowStillnessDetector
+    # ── Imports (deferred to allow --help without heavy deps) ────────────────
+    from edge_detector import EdgeDetector
     from tracker import build_tracker
     from ui_overlay import UIOverlay
+    from id_service import IdentificationService
 
     # ── Determine ID service backend ─────────────────────────────────────────
-    use_remote_gemma = args.use_remote_gemma
-    remote_gemma_url = args.remote_gemma_url or os.environ.get("REMOTE_GEMMA_URL", "")
+    remote_url = args.remote_url or os.environ.get("REMOTE_URL", "")
 
-    if use_remote_gemma or remote_gemma_url:
-        from gemma_remote_service import GemmaRemoteService
-        id_backend_name = "Gemma 3 4B (self-hosted)"
-        id_service_class = GemmaRemoteService
-        # Use higher defaults for remote Gemma if not explicitly set
-        batch_size = args.batch_size if args.batch_size != 4 else 8  # 4 is OpenRouter default
-        batch_wait = args.batch_wait if args.batch_wait != 1500 else 1000  # 1500 is OpenRouter default
-        id_service_kwargs = dict(
-            remote_url    = remote_gemma_url,
-            api_key       = args.remote_gemma_key or os.environ.get("REMOTE_GEMMA_KEY"),
-            cache_ttl     = args.id_ttl,
-            batch_size    = batch_size,
-            batch_wait_ms = batch_wait,
-        )
-    else:
-        from id_service import IdentificationService, NEMOTRON_MODEL
-        id_backend_name = "OpenRouter / Nemotron Nano 12B VL"
-        id_service_class = IdentificationService
-        id_service_kwargs = dict(
-            api_key       = args.openrouter_key,
-            model         = args.model or NEMOTRON_MODEL,
-            cache_ttl     = args.id_ttl,
-            batch_size    = args.batch_size,
-            batch_wait_ms = args.batch_wait,
-        )
+    if not remote_url:
+        print("[Main] WARNING: No --remote-url provided. Identification will not work.")
+        print("[Main] Set REMOTE_URL env var or pass --remote-url")
+
+    id_service_kwargs = dict(
+        remote_url=remote_url,
+        api_key=args.remote_key or os.environ.get("REMOTE_API_KEY"),
+        cache_ttl=args.id_ttl,
+        batch_size=args.batch_size,
+        batch_wait_ms=args.batch_wait,
+    )
 
     # ── Build components ─────────────────────────────────────────────────────
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("  VisionTracker starting")
-    print(f"  ID backend: {id_backend_name}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-    detector = Detector(
-        model_name=args.detector,
+    detector = EdgeDetector(
+        min_area=args.edge_min_area,
+        max_area=args.edge_max_area,
+        canny_low=args.canny_low,
+        canny_high=args.canny_high,
+        use_bg_removal=args.use_bg_removal,
         skip_frames=args.skip_frames,
-        conf_threshold=args.conf,
-        imgsz=args.imgsz,
-        device=args.device,
     )
 
     tracker = build_tracker(args.tracker)
 
-    if args.optical_flow:
-        stillness = OpticalFlowStillnessDetector(
-            history_len=args.still_window,
-            still_frames=args.still_frames,
-        )
-        print("[Main] Using optical-flow stillness detector")
-    else:
-        stillness = IoUVelocityStillnessDetector(
-            history_len=args.still_window,
-            still_frames=args.still_frames,
-            velocity_thresh=args.velocity_thresh,
-            iou_thresh=args.iou_thresh,
-        )
+    id_service = IdentificationService(**id_service_kwargs)
 
-    id_service = id_service_class(**id_service_kwargs)
-
-    overlay = UIOverlay(
-        show_velocity=args.show_velocity,
-    )
+    overlay = UIOverlay(show_velocity=args.show_velocity)
     fps_counter = FPSCounter()
 
     # ── Open camera / video ──────────────────────────────────────────────────
@@ -232,20 +227,21 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
         print(f"[Main] ERROR: Cannot open input: {args.input}", file=sys.stderr)
         return 1
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)  # reduce latency
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # reduce latency
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[Main] Capture: {actual_w}×{actual_h}")
-    print(f"[Main] Detector: {args.detector} | skip={args.skip_frames}")
-    print(f"[Main] Tracker:  {tracker.name}")
-    print(f"[Main] Stillness: M={args.still_frames} frames, N={args.still_window} window")
+    print(f"[Main] Detector: Edge/Canny | skip={args.skip_frames}")
+    print(f"[Main] Tracker: {tracker.name}")
+    print(f"[Main] ID interval: {args.id_interval}s")
     if not args.no_display:
         print("[Main] Press Q to quit.\n")
 
     active_track_ids: set[int] = set()
+    last_id_time: dict[int, float] = {}  # track_id -> last identification time
 
     # ── Main loop ────────────────────────────────────────────────────────────
     try:
@@ -261,52 +257,53 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
             else:
                 display_frame = frame
 
-            # ── Detect ────────────────────────────────────────────────────
+            # ── Detect ──────────────────────────────────────────────────────
             det_result = detector.detect(display_frame)
 
-            # ── Track ─────────────────────────────────────────────────────
+            # ── Track ───────────────────────────────────────────────────────
             tracked = tracker.update(det_result)
             current_ids = {obj.track_id for obj in tracked}
 
+            # Cleanup disappeared tracks
             for tid in active_track_ids - current_ids:
-                stillness.remove_track(tid)
+                last_id_time.pop(tid, None)
             active_track_ids = current_ids
 
-            if args.optical_flow:
-                gf = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
-                stillness.process_frame(gf)  # type: ignore[attr-defined]
+            # ── Draw annotated frame for LLM ─────────────────────────────────
+            annotated_for_llm = draw_annotated_frame(display_frame, tracked)
 
-            # ── Stillness gating + multi-object ID submission ──────────────
-            velocities: dict[int, float] = {}
+            # ── Periodic identification submission ──────────────────────────
+            now = time.monotonic()
+            tracks_to_id = []
+
             for obj in tracked:
-                stillness.update(obj.track_id, obj.xyxy)
+                tid = obj.track_id
+                last_time = last_id_time.get(tid, 0)
 
-                if hasattr(stillness, "get_velocity"):
-                    velocities[obj.track_id] = stillness.get_velocity(obj.track_id)  # type: ignore
+                # Check if enough time has passed and not already cached
+                if (now - last_time > args.id_interval and
+                        id_service.get_cached(tid) is None):
+                    tracks_to_id.append(tid)
+                    last_id_time[tid] = now
 
-                if stillness.is_still(obj.track_id):
-                    if id_service.get_cached(obj.track_id) is None:
-                        crop = crop_object(frame, obj.xyxy)
-                        if crop.size > 0:
-                            submitted = id_service.submit(
-                                obj.track_id, crop, obj.class_name, obj.class_id
-                            )
-                            if submitted:
-                                q_depth = id_service.queue_depth()
-                                print(f"[Main] → queued #{obj.track_id} ({obj.class_name}) "
-                                      f"| queue depth: {q_depth}")
-                            stillness.reset(obj.track_id)
-                    else:
-                        id_service.inject_cached(obj.track_id)
+            if tracks_to_id:
+                submitted = id_service.submit(
+                    track_ids=tracks_to_id,
+                    annotated_frame=annotated_for_llm,
+                )
+                if submitted:
+                    q_depth = id_service.queue_depth()
+                    print(f"[Main] → queued tracks {tracks_to_id} | queue depth: {q_depth}")
 
-            # ── Render ────────────────────────────────────────────────────
+            # Inject cached labels into progress
+            for obj in tracked:
+                id_service.inject_cached(obj.track_id)
+
+            # ── Render ──────────────────────────────────────────────────────
             fps = fps_counter.tick()
-            if use_remote_gemma or remote_gemma_url:
-                backend_str = f"gemma-remote | q:{id_service.queue_depth()}"
-                mode_str = "remote-gemma"
-            else:
-                backend_str = f"nemotron | q:{id_service.queue_depth()}"
-                mode_str = "openrouter"
+            backend_str = f"remote | q:{id_service.queue_depth()}"
+            mode_str = "edge-llm"
+
             annotated = overlay.draw(
                 frame=display_frame,
                 tracked_objects=tracked,
@@ -314,7 +311,7 @@ def main() -> int:  # noqa: C901 (acceptable complexity for an orchestrator)
                 fps=fps,
                 mode=mode_str,
                 backend=backend_str,
-                velocities=velocities if args.show_velocity else None,
+                velocities=None,
             )
 
             if not args.no_display:

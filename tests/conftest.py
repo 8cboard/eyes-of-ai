@@ -24,22 +24,14 @@ def synthetic_frame_720p() -> np.ndarray:
 
 
 @pytest.fixture
-def synthetic_crop() -> np.ndarray:
-    """Return a small synthetic BGR crop (simulated object region)."""
-    crop = np.zeros((100, 80, 3), dtype=np.uint8)
-    crop[20:80, 10:70] = (100, 200, 50)
-    return crop
-
-
-@pytest.fixture
 def synthetic_detections():
     """Return a fake DetectionResult with two synthetic boxes."""
-    from detector import DetectionResult
+    from edge_detector import DetectionResult
     return DetectionResult(
         xyxy=np.array([[300, 200, 600, 400], [800, 100, 1000, 200]], dtype=np.float32),
         confidences=np.array([0.92, 0.75], dtype=np.float32),
-        class_ids=np.array([0, 73], dtype=np.int32),  # person, book
-        class_names=["person", "book"],
+        class_ids=np.array([0, 0], dtype=np.int32),  # all "object" class
+        class_names=["object", "object"],
         frame_index=1,
         inference_ms=12.5,
     )

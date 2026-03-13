@@ -1,8 +1,11 @@
 """
-Remote LLM Server for VisionTracker
+Remote LLM Server for VisionTracker — Single Object Mode
 
 FastAPI server supporting both GGUF (llama-cpp-python) and Safetensors
 (transformers) vision-language models.
+
+Each request contains a full frame with a SINGLE bounding box drawn.
+The LLM returns a single common noun describing the boxed object.
 
 Auto-detects model format:
 - GGUF: File ends with .gguf extension
@@ -27,7 +30,7 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Header
 import uvicorn
 
-app = FastAPI(title="VisionTracker Remote ID Server", version="2.0.0")
+app = FastAPI(title="VisionTracker Remote ID Server", version="2.1.0")
 
 # Global model instance
 _model = None
@@ -37,12 +40,11 @@ _MAX_MODEL_SIZE_GB = 10
 
 
 class IdentifyRequest(BaseModel):
-    annotated_image: str  # base64 JPEG
-    color_map: dict[str, int]  # {"red": 1, "blue": 2, ...}
+    annotated_image: str  # base64 JPEG (full frame with single box drawn)
 
 
 class IdentifyResponse(BaseModel):
-    results: list[dict]  # [{"track_id": int, "description": str}]
+    result: str  # single common noun (e.g., "person", "car", "chair")
 
 
 def _check_model_size(model_path: str) -> float:
@@ -149,43 +151,19 @@ def load_model(model_path: str):
         raise ValueError(f"Unsupported model type: {model_type}")
 
 
-def create_prompt(color_map: dict[str, int]) -> str:
-    """Create prompt for single common noun responses.
+SINGLE_OBJECT_PROMPT = """Look at the image. There is a green bounding box drawn around one object.
 
-    Example output format:
-        1. person
-        2. car
-        3. dog
-    """
-    n = len(color_map)
+What object is inside the bounding box?
 
-    color_items = sorted(color_map.items(), key=lambda x: x[1])
-    color_list = ", ".join([f"{color} (object #{tid})" for color, tid in color_items])
+Answer with exactly ONE common noun. Use simple everyday words like: person, car, dog, cat, chair, table, phone, book, cup, bottle, backpack, laptop, etc.
 
-    prompt = (
-        f"You see {n} colored boxes on objects in an image. "
-        f"The colors and their object numbers are: {color_list}.\n\n"
-        "Identify each object with exactly ONE common noun. "
-        "Use simple everyday words like: person, car, dog, cat, chair, table, phone, book, cup, bottle, etc.\n\n"
-        "Respond in this exact format (one per line):\n"
-    )
-
-    for i, (color, tid) in enumerate(color_items, 1):
-        prompt += f"{i}. [common noun for the {color} box]\n"
-
-    prompt += (
-        "\nBe concise. Use only single words or very short two-word phrases. "
-        "Examples: 'person', 'red car', 'dog', 'wooden chair'"
-    )
-
-    return prompt
+Respond with only the noun, nothing else. Examples: "person", "car", "wooden chair", "coffee mug"
+"""
 
 
-def identify_with_gguf(image: Image.Image, color_map: dict[str, int]) -> dict[int, str]:
-    """Run identification using GGUF model."""
+def identify_with_gguf(image: Image.Image) -> str:
+    """Run single-object identification using GGUF model."""
     import io
-
-    prompt = create_prompt(color_map)
 
     # Convert image to base64 for llama-cpp
     img_buffer = io.BytesIO()
@@ -193,7 +171,7 @@ def identify_with_gguf(image: Image.Image, color_map: dict[str, int]) -> dict[in
     img_b64 = base64.b64encode(img_buffer.getvalue()).decode()
 
     content = [
-        {"type": "text", "text": prompt},
+        {"type": "text", "text": SINGLE_OBJECT_PROMPT},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
     ]
 
@@ -201,27 +179,25 @@ def identify_with_gguf(image: Image.Image, color_map: dict[str, int]) -> dict[in
 
     response = _model.create_chat_completion(
         messages=messages,
-        max_tokens=100 * len(color_map),
+        max_tokens=50,
         temperature=0.2,
-        stop=["</s>"],
+        stop=["</s>", "\n"],
     )
 
     raw_text = response["choices"][0]["message"]["content"].strip()
-    return parse_response(raw_text, color_map)
+    return parse_single_response(raw_text)
 
 
-def identify_with_safetensors(image: Image.Image, color_map: dict[str, int]) -> dict[int, str]:
-    """Run identification using Safetensors model."""
+def identify_with_safetensors(image: Image.Image) -> str:
+    """Run single-object identification using Safetensors model."""
     import torch
 
     model = _model["model"]
     processor = _model["processor"]
     device = _model["device"]
 
-    prompt = create_prompt(color_map)
-
     # Process inputs
-    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    inputs = processor(text=SINGLE_OBJECT_PROMPT, images=image, return_tensors="pt")
     if device == "cuda":
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -229,64 +205,39 @@ def identify_with_safetensors(image: Image.Image, color_map: dict[str, int]) -> 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=100 * len(color_map),
+            max_new_tokens=20,
             temperature=0.2,
             do_sample=True,
         )
 
     # Decode
     raw_text = processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
-    return parse_response(raw_text, color_map)
+    return parse_single_response(raw_text)
 
 
-def parse_response(text: str, color_map: dict[str, int]) -> dict[int, str]:
-    """Parse numbered list response into {track_id: description}."""
-    results = {}
-    color_items = sorted(color_map.items(), key=lambda x: x[1])
+def parse_single_response(text: str) -> str:
+    """Parse LLM response to extract single common noun."""
+    # Clean up the response
+    text = text.strip().lower()
 
-    # Try numbered list pattern: "1. noun" or "1) noun"
-    pattern = re.compile(r"^\s*(\d+)[.)]\s*(.+)$")
+    # Remove quotes if present
+    text = text.strip('"\'')
 
-    numbered = {}
-    for line in text.splitlines():
-        m = pattern.match(line)
-        if m:
-            idx = int(m.group(1)) - 1
-            desc = m.group(2).strip().lower()
-            # Clean up: take only first word or short phrase
-            desc = re.sub(r'[^\w\s-]', '', desc).strip()
-            if desc:
-                numbered[idx] = desc
+    # Take only the first line if multiple lines
+    text = text.split('\n')[0].strip()
 
-    # Map to track IDs
-    for i, (color, tid) in enumerate(color_items):
-        if i in numbered:
-            results[tid] = numbered[i]
-        else:
-            # Fallback: extract any noun-like word
-            fallback = extract_noun(text, i) or "object"
-            results[tid] = fallback
+    # Remove trailing punctuation
+    text = re.sub(r'[.!?]+$', '', text).strip()
 
-    return results
+    # Validate: should be a reasonable noun phrase (1-3 words)
+    words = text.split()
+    if len(words) == 0 or len(words) > 4:
+        return "object"
 
+    # Clean up any remaining special characters
+    text = re.sub(r'[^\w\s-]', '', text).strip()
 
-def extract_noun(text: str, index: int) -> Optional[str]:
-    """Extract a noun from text as fallback."""
-    # Simple heuristic: find words that look like nouns
-    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-    common_nouns = [
-        "person", "people", "man", "woman", "child", "car", "truck", "bus",
-        "dog", "cat", "animal", "bird", "chair", "table", "desk", "couch",
-        "phone", "laptop", "computer", "screen", "book", "cup", "bottle",
-        "bag", "backpack", "box", "ball", "bike", "bicycle", "motorcycle",
-        "tree", "plant", "flower", "building", "house", "door", "window"
-    ]
-
-    for word in words:
-        if word in common_nouns:
-            return word
-
-    return None
+    return text if text else "object"
 
 
 @app.get("/health")
@@ -296,7 +247,7 @@ async def health_check():
         "status": "healthy",
         "model": _model_name,
         "type": _model_type,
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
@@ -305,7 +256,7 @@ async def identify(
     request: IdentifyRequest,
     authorization: Optional[str] = Header(None)
 ):
-    """Identify objects in the provided annotated frame."""
+    """Identify the single object in the provided annotated frame."""
     # Check API key if configured
     server_key = os.environ.get("SERVER_API_KEY")
     if server_key and authorization != f"Bearer {server_key}":
@@ -314,9 +265,6 @@ async def identify(
     if _model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    if not request.color_map:
-        return IdentifyResponse(results=[])
-
     try:
         # Decode image
         img_bytes = base64.b64decode(request.annotated_image)
@@ -324,19 +272,13 @@ async def identify(
 
         # Run identification
         if _model_type == "gguf":
-            results = identify_with_gguf(image, request.color_map)
+            result = identify_with_gguf(image)
         elif _model_type == "safetensors":
-            results = identify_with_safetensors(image, request.color_map)
+            result = identify_with_safetensors(image)
         else:
             raise HTTPException(status_code=500, detail="Unknown model type")
 
-        # Build response
-        response_results = [
-            {"track_id": tid, "description": desc}
-            for tid, desc in results.items()
-        ]
-
-        return IdentifyResponse(results=response_results)
+        return IdentifyResponse(result=result)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

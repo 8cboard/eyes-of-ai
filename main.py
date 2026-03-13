@@ -2,7 +2,10 @@
 main.py — VisionTracker entry point.
 
 Orchestrates the full pipeline:
-  Camera → EdgeDetector → Tracker → Draw Annotated Frame → IDService → UIOverlay
+  Camera → EdgeDetector → Tracker → For each object: Draw Frame with Single Box → IDService → UIOverlay
+
+For each tracked object, sends the full frame with ONLY that object's bounding box drawn.
+Multiple requests per frame - one per object.
 
 Run:
   python main.py --remote-url https://xxx.ngrok.io
@@ -144,29 +147,38 @@ def _color(track_id: int) -> tuple[int, int, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Annotated frame drawer
+# Single-box frame drawer for per-object identification
 # ─────────────────────────────────────────────────────────────────────────────
 
-def draw_annotated_frame(
+def draw_frame_with_single_box(
     frame: np.ndarray,
-    tracked_objects: list,
+    xyxy: np.ndarray,
     box_thickness: int = 3,
+    box_color: tuple[int, int, int] = (0, 255, 0),  # Green box
 ) -> np.ndarray:
-    """Draw colored bounding boxes on frame for LLM identification.
+    """Draw a single bounding box on a copy of the frame.
 
-    Each track gets a unique color that the LLM uses to identify objects.
+    Parameters
+    ----------
+    frame : np.ndarray
+        Original frame (BGR).
+    xyxy : np.ndarray
+        Bounding box [x1, y1, x2, y2].
+    box_thickness : int
+        Thickness of the bounding box line.
+    box_color : tuple[int, int, int]
+        BGR color for the box (default green).
+
+    Returns
+    -------
+    np.ndarray
+        Frame copy with single bounding box drawn.
     """
     annotated = frame.copy()
+    x1, y1, x2, y2 = xyxy.astype(int)
 
-    for obj in tracked_objects:
-        color = _color(obj.track_id)
-        x1, y1, x2, y2 = obj.xyxy.astype(int)
-
-        # Draw bounding box
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, box_thickness)
-
-        # Draw small color indicator dot in corner
-        cv2.circle(annotated, (x1 + 8, y1 + 8), 6, color, -1)
+    # Draw bounding box
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, box_thickness)
 
     return annotated
 
@@ -269,10 +281,8 @@ def main() -> int:
                 last_id_time.pop(tid, None)
             active_track_ids = current_ids
 
-            # ── Draw annotated frame for LLM ─────────────────────────────────
-            annotated_for_llm = draw_annotated_frame(display_frame, tracked)
-
             # ── Periodic identification submission ──────────────────────────
+            # For each tracked object, send a full frame with ONLY that object's box
             now = time.monotonic()
             tracks_to_id = []
 
@@ -286,14 +296,21 @@ def main() -> int:
                     tracks_to_id.append(tid)
                     last_id_time[tid] = now
 
-            if tracks_to_id:
-                submitted = id_service.submit(
-                    track_ids=tracks_to_id,
-                    annotated_frame=annotated_for_llm,
-                )
-                if submitted:
-                    q_depth = id_service.queue_depth()
-                    print(f"[Main] → queued tracks {tracks_to_id} | queue depth: {q_depth}")
+            # Submit one frame per object (each with only that object's box)
+            for obj in tracked:
+                if obj.track_id in tracks_to_id:
+                    # Create frame with only this object's bounding box
+                    frame_with_single_box = draw_frame_with_single_box(
+                        display_frame, obj.xyxy
+                    )
+
+                    submitted = id_service.submit(
+                        track_id=obj.track_id,
+                        frame_with_box=frame_with_single_box,
+                    )
+                    if submitted:
+                        q_depth = id_service.queue_depth()
+                        print(f"[Main] → queued track #{obj.track_id} | queue depth: {q_depth}")
 
             # Inject cached labels into progress
             for obj in tracked:

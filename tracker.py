@@ -39,12 +39,12 @@ from scipy.optimize import linear_sum_assignment
 # supervision is MIT-licensed and ships ByteTrack
 try:
     import supervision as sv
-    _SUPERVISION_AVAILABLE = False
+    _SUPERVISION_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _SUPERVISION_AVAILABLE = False
     sv = None  # type: ignore
 
-from detector import DetectionResult
+from edge_detector import DetectionResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────

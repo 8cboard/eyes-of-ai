@@ -152,9 +152,9 @@ class UIOverlay:
         label = prog.get("label")
         progress_val = prog.get("progress", 0.0)
 
-        # Line 1: Track ID + class
+        # Line 1: Class only (no track ID)
         conf_str = f" {obj.confidence:.0%}" if self.show_confidence else ""
-        header = f"#{obj.track_id} {obj.class_name}{conf_str}"
+        header = f"{obj.class_name}{conf_str}"
 
         # Line 2: ID result or status
         if status == "done" and label:

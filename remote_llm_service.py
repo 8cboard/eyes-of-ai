@@ -1,46 +1,26 @@
 """
-gemma_remote_service.py — Self-Hosted Gemma 3 4B HTTP Client
+remote_llm_service.py — Remote LLM Identification Service
 
-Backend: User-hosted Gemma 3 4B model on Google Colab or Kaggle via FastAPI
+Sends full annotated frames (with colored bounding boxes) to a remote
+Kaggle/Colab server running a vision-language model for identification.
 
-Setup:
-  1. Run the Colab or Kaggle notebook from remote_server/
-  2. Copy the ngrok public URL
-  3. python main.py --use-remote-gemma --remote-gemma-url https://xxx.ngrok.io
+The remote server supports models <10GB in either:
+  - GGUF format (via llama-cpp-python)
+  - safetensors format (via transformers)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  DESIGN DIFFERENCES FROM OpenRouter (id_service.py)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Unlike the old architecture that sent individual crops, this service sends
+the full annotated image and receives descriptions for all tracked objects.
 
-Unlike OpenRouter's free tier with strict 20 RPM limits, the self-hosted
-server has no enforced rate limit — the user controls capacity via their
-Colab/Kaggle instance. Key differences:
-
-  ✗ No TokenBucket rate limiter (user controls server capacity)
-  ✓ Higher default batch size (8 vs 4) — Colab/Kaggle can handle more
-  ✓ Longer timeout (60s vs 20s) — local inference may be slower
-  ✓ Health check endpoint — verifies server before submitting
-  ✓ Retry with exponential backoff for transient failures
-  ✗ No 429 handling (server doesn't rate limit)
-
-Progress dict format (same as id_service.py for UI compatibility):
-  {
-    track_id (int): {
-        "status":   "idle" | "queued" | "identifying" | "done" | "error",
-        "progress": float 0.0 – 1.0,
-        "label":    str | None,
-        "error":    str | None,
-    }
-  }
-
-Privacy:
-  Crops sent over HTTPS to your self-hosted server.
-  Images never touch third-party APIs.
+Usage:
+    service = RemoteLLMService(remote_url="https://xxx.ngrok.io")
+    service.submit(track_id, annotated_frame, track_ids_in_frame)
+    label = service.get_cached(track_id)
 """
 
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -60,43 +40,39 @@ except ImportError:  # pragma: no cover
     _REQ_OK = False
     _req = None  # type: ignore
 
-log = logging.getLogger("gemma_remote")
+log = logging.getLogger("remote_llm")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration constants (all overridable in GemmaRemoteService.__init__)
+# Configuration constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_REMOTE_URL = ""
-DEFAULT_BATCH_SIZE = 8           # Higher than OpenRouter — user controls capacity
-DEFAULT_BATCH_WAIT_MS = 1_000    # Slightly faster dispatch (less queuing delay)
+DEFAULT_BATCH_SIZE = 1           # One annotated frame per request
+DEFAULT_BATCH_WAIT_MS = 500      # Short wait — frames come continuously
 REQUEST_TIMEOUT_S = 60           # Longer timeout for local model inference
 MAX_RETRIES = 3                  # Retry failed requests with backoff
 RETRY_BASE_DELAY_S = 2.0         # Base delay for exponential backoff
 
 # Image encoding
-JPEG_QUALITY = 72                # Same as id_service.py
-MAX_CROP_PX = 336                # Same as id_service.py
+JPEG_QUALITY = 75                # Balance quality vs bandwidth
+MAX_FRAME_PX = 1280              # Resize if frame is larger
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data structures (reused from id_service.py for compatibility)
+# Data structures
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(order=True)
-class PendingItem:
-    """One crop awaiting identification. Sortable by priority for the queue."""
-    priority:     float       = field()          # lower = served sooner (FIFO default)
-    track_id:     int         = field(compare=False)
-    crop:         np.ndarray  = field(compare=False)
-    class_name:   str         = field(compare=False)
-    class_id:     int         = field(compare=False)
+class PendingFrame:
+    """One annotated frame awaiting identification."""
+    priority:     float       = field()          # lower = served sooner
+    track_id:     int         = field(compare=False)  # Primary track being focused
+    frame:        np.ndarray  = field(compare=False)  # Annotated frame (with boxes)
+    track_ids:    list[int]   = field(compare=False)  # All track IDs in frame
     submitted_at: float       = field(compare=False, default_factory=time.monotonic)
 
 
 class IdentificationCache:
     """Thread-safe per-track label cache with configurable TTL.
-
-    Copied from id_service.py for self-containment.
 
     Parameters
     ----------
@@ -105,8 +81,8 @@ class IdentificationCache:
     """
 
     def __init__(self, ttl_seconds: float = 45.0) -> None:
-        self._ttl   = ttl_seconds
-        self._lock  = threading.Lock()
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
         # {track_id: (label, inserted_at)}
         self._store: dict[int, tuple[str, float]] = {}
 
@@ -144,11 +120,11 @@ class IdentificationCache:
 # Remote HTTP client
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GemmaHTTPClient:
-    """HTTP client for the self-hosted Gemma remote server.
+class RemoteLLMClient:
+    """HTTP client for the remote LLM server.
 
     Communicates with a FastAPI server running on Colab/Kaggle via ngrok tunnel.
-    Supports batch identification of multiple objects in a single request.
+    Sends full annotated frames and receives identification results.
 
     Parameters
     ----------
@@ -163,23 +139,23 @@ class GemmaHTTPClient:
     def __init__(
         self,
         base_url: str,
-        api_key:  Optional[str] = None,
-        timeout:  float = REQUEST_TIMEOUT_S,
+        api_key: Optional[str] = None,
+        timeout: float = REQUEST_TIMEOUT_S,
     ) -> None:
         if not base_url:
             raise ValueError(
-                "Remote Gemma server URL is required.\n"
-                "  1. Run the Colab notebook: remote_server/colab_setup.ipynb\n"
+                "Remote LLM server URL is required.\n"
+                "  1. Run the Colab/Kaggle notebook from remote_server/\n"
                 "  2. Copy the public URL (e.g., https://xxx.ngrok.io)\n"
-                "  3. python main.py --use-remote-gemma --remote-gemma-url https://xxx.ngrok.io"
+                "  3. python main.py --remote-url https://xxx.ngrok.io"
             )
         if not _REQ_OK:
             raise ImportError("pip install requests")
 
         self._base_url = base_url.rstrip("/")
-        self._api_key  = api_key
-        self._timeout  = timeout
-        self._session  = _req.Session()
+        self._api_key = api_key
+        self._timeout = timeout
+        self._session = _req.Session()
 
         # Health check on init
         self._check_health()
@@ -193,10 +169,10 @@ class GemmaHTTPClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            print(f"[GemmaRemote] Connected to server: {data.get('model', 'unknown')}")
+            print(f"[RemoteLLM] Connected to server: {data.get('model', 'unknown')}")
         except Exception as exc:
-            print(f"[GemmaRemote] ⚠️  Health check failed: {exc}")
-            print(f"[GemmaRemote] Server may still be starting up...")
+            print(f"[RemoteLLM] ⚠️  Health check failed: {exc}")
+            print(f"[RemoteLLM] Server may still be starting up...")
 
     def _headers(self) -> dict[str, str]:
         """Build request headers with optional auth."""
@@ -205,34 +181,28 @@ class GemmaHTTPClient:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
-    def identify_batch(self, items: list[PendingItem]) -> dict[int, str]:
-        """Identify a batch of objects via the remote server.
+    def identify_frame(self, frame_b64: str, track_ids: list[int]) -> dict[int, str]:
+        """Send an annotated frame to the remote server for identification.
 
         Parameters
         ----------
-        items : list[PendingItem]
-            List of crops to identify
+        frame_b64 : str
+            Base64-encoded JPEG of the annotated frame
+        track_ids : list[int]
+            List of track IDs visible in the frame
 
         Returns
         -------
         dict[int, str]
-            {track_id: description_string} for each item
+            {track_id: description_string} for each track
 
         Raises
         ------
         requests.RequestException
             If the request fails after retries
         """
-        n = len(items)
-
-        # Encode images
-        images_b64 = [_encode_crop(item.crop) for item in items]
-        class_names = [item.class_name for item in items]
-        track_ids = [item.track_id for item in items]
-
         payload = {
-            "images": images_b64,
-            "class_names": class_names,
+            "annotated_image": frame_b64,
             "track_ids": track_ids,
         }
 
@@ -249,45 +219,46 @@ class GemmaHTTPClient:
                 resp.raise_for_status()
 
                 data = resp.json()
-                results = {}
+                results: dict[int, str] = {}
+
+                # Parse results from server
                 for result in data.get("results", []):
                     tid = result.get("track_id")
                     desc = result.get("description", "")
                     if tid is not None:
                         results[tid] = desc
 
-                # Fill in any missing results with class_name
-                for item in items:
-                    if item.track_id not in results:
-                        results[item.track_id] = item.class_name
+                # Fill in any missing results
+                for tid in track_ids:
+                    if tid not in results:
+                        results[tid] = f"object #{tid}"
 
                 return results
 
             except _req.exceptions.RequestException as exc:
                 last_exception = exc
                 if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BASE_DELAY_S * (2 ** attempt)  # Exponential backoff
-                    print(f"[GemmaRemote] Request failed (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay:.1f}s...")
+                    delay = RETRY_BASE_DELAY_S * (2 ** attempt)
+                    print(f"[RemoteLLM] Request failed (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay:.1f}s...")
                     time.sleep(delay)
                 else:
                     break
 
         # All retries exhausted
-        raise last_exception or RuntimeError("Unknown error in identify_batch")
+        raise last_exception or RuntimeError("Unknown error in identify_frame")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main service — single dispatcher, batching, no rate limiting
+# Main service — background dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GemmaRemoteService:
-    """Non-blocking multi-object identification using self-hosted Gemma 3 4B.
+class RemoteLLMService:
+    """Non-blocking identification using remote LLM server.
 
     One background thread (*dispatcher*) owns all HTTP traffic.
-    The main thread calls ``submit()`` which puts items into a
-    ``PriorityQueue``.  The dispatcher assembles batches and fires
-    HTTP requests to the remote server.  No rate limiting — the user
-    controls server capacity via their Colab/Kaggle instance.
+    The main thread calls ``submit()`` which puts frames into a
+    ``PriorityQueue``. The dispatcher sends annotated frames to the
+    remote server and writes results into the shared ``progress`` dict.
 
     Parameters
     ----------
@@ -298,50 +269,48 @@ class GemmaRemoteService:
     cache_ttl : float
         Seconds a cached result stays valid.
     batch_size : int
-        Max crops per API call (1–16 recommended; larger = more latency)
+        Always 1 in this architecture (one frame per request)
     batch_wait_ms : int
-        How long (ms) the dispatcher waits for a fuller batch.
-        Higher = fewer requests but slightly more ID latency.
+        How long (ms) the dispatcher waits before sending a frame.
     """
 
     def __init__(
         self,
-        remote_url:    str,
-        api_key:       Optional[str] = None,
-        cache_ttl:     float = 45.0,
-        batch_size:    int   = DEFAULT_BATCH_SIZE,
-        batch_wait_ms: int   = DEFAULT_BATCH_WAIT_MS,
+        remote_url: str,
+        api_key: Optional[str] = None,
+        cache_ttl: float = 45.0,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_wait_ms: int = DEFAULT_BATCH_WAIT_MS,
     ) -> None:
-        self._client     = GemmaHTTPClient(base_url=remote_url, api_key=api_key)
-        self._cache      = IdentificationCache(ttl_seconds=cache_ttl)
-        self._batch_sz   = max(1, min(batch_size, 16))  # Cap at 16 for safety
-        self._batch_wait = batch_wait_ms / 1_000.0  # ms → s
+        self._client = RemoteLLMClient(base_url=remote_url, api_key=api_key)
+        self._cache = IdentificationCache(ttl_seconds=cache_ttl)
+        self._batch_sz = 1  # Always 1 frame per request
+        self._batch_wait = batch_wait_ms / 1000.0
 
         # Shared progress dict — read by ui_overlay at frame rate
         self.progress: dict[int, dict] = {}
-        self._prog_lock  = threading.Lock()
+        self._prog_lock = threading.Lock()
 
-        # Priority queue (smallest priority value dispatched first)
-        self._q: queue.PriorityQueue[PendingItem] = queue.PriorityQueue()
+        # Priority queue
+        self._q: queue.PriorityQueue[PendingFrame] = queue.PriorityQueue()
 
         # Track which track_ids are currently queued or in-flight
         self._inflight: set[int] = set()
-        self._ifl_lock  = threading.Lock()
+        self._ifl_lock = threading.Lock()
 
         # Counters for debugging / UI
         self.stats = dict(requests=0, identified=0, errors=0, retries=0)
 
-        # Start the single dispatcher thread
+        # Start the dispatcher thread
         self._alive = True
         self._thread = threading.Thread(
-            target=self._dispatch_loop, name="gemma-remote-dispatcher", daemon=True
+            target=self._dispatch_loop, name="remote-llm-dispatcher", daemon=True
         )
         self._thread.start()
 
-        print(f"[GemmaRemote] Self-hosted Gemma 3 4B")
-        print(f"[GemmaRemote] Server: {remote_url}")
-        print(f"[GemmaRemote] Batch size: {self._batch_sz} | Batch wait: {batch_wait_ms}ms")
-        print(f"[GemmaRemote] Cache TTL: {cache_ttl}s")
+        print(f"[RemoteLLM] Remote LLM identification service")
+        print(f"[RemoteLLM] Server: {remote_url}")
+        print(f"[RemoteLLM] Cache TTL: {cache_ttl}s")
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -351,13 +320,12 @@ class GemmaRemoteService:
 
     def submit(
         self,
-        track_id:   int,
-        crop:       np.ndarray,
-        class_name: str,
-        class_id:   int,
-        priority:   Optional[float] = None,
+        track_id: int,
+        annotated_frame: np.ndarray,
+        track_ids: list[int],
+        priority: Optional[float] = None,
     ) -> bool:
-        """Enqueue *crop* for background identification.
+        """Enqueue an annotated frame for background identification.
 
         Returns True if enqueued, False if already in-flight or cached.
         Pass a lower *priority* value to jump ahead in the queue.
@@ -369,12 +337,11 @@ class GemmaRemoteService:
                 return False
             self._inflight.add(track_id)
 
-        item = PendingItem(
-            priority   = priority if priority is not None else time.monotonic(),
-            track_id   = track_id,
-            crop       = crop.copy(),
-            class_name = class_name,
-            class_id   = class_id,
+        item = PendingFrame(
+            priority=priority if priority is not None else time.monotonic(),
+            track_id=track_id,
+            frame=annotated_frame.copy(),
+            track_ids=track_ids,
         )
         self._q.put(item)
         self._set_prog(track_id, "queued", 0.0)
@@ -393,136 +360,133 @@ class GemmaRemoteService:
         """Stop the dispatcher thread gracefully."""
         self._alive = False
         # Sentinel item to unblock queue.get()
-        self._q.put(PendingItem(
-            priority=float("inf"), track_id=-1,
-            crop=np.zeros((1, 1, 3), np.uint8),
-            class_name="__stop__", class_id=-1,
+        self._q.put(PendingFrame(
+            priority=float("inf"),
+            track_id=-1,
+            frame=np.zeros((10, 10, 3), np.uint8),
+            track_ids=[],
         ))
         self._thread.join(timeout=3.0)
 
-    # ── Dispatcher (background thread — single, serialised) ────────────────────
+    # ── Dispatcher (background thread) ─────────────────────────────────────────
 
     def _dispatch_loop(self) -> None:
-        """Collect batches from the queue and send to remote server."""
+        """Collect frames from the queue and send to remote server."""
         while self._alive:
             # Block until at least one item arrives
             try:
-                first = self._q.get(timeout=1.0)
+                item = self._q.get(timeout=1.0)
             except queue.Empty:
-                self._cache.evict_expired()   # housekeeping while idle
+                self._cache.evict_expired()
                 continue
 
-            if first.track_id == -1:          # stop sentinel
+            if item.track_id == -1:  # stop sentinel
                 break
 
-            batch: list[PendingItem] = [first]
-
-            # ── Fill batch (wait up to batch_wait for more items) ─────────
-            deadline = time.monotonic() + self._batch_wait
-            while len(batch) < self._batch_sz:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                try:
-                    item = self._q.get(timeout=left)
-                except queue.Empty:
-                    break
-
-                if item.track_id == -1:
-                    self._alive = False
-                    break
-
-                # Skip if already identified while we were waiting
-                if self._cache.get(item.track_id) is not None:
-                    self._set_prog(item.track_id, "done", 1.0,
-                                   label=self._cache.get(item.track_id))
-                    with self._ifl_lock:
-                        self._inflight.discard(item.track_id)
-                    continue
-
-                batch.append(item)
-
-            if not batch:
+            # Skip if already identified while waiting
+            if self._cache.get(item.track_id) is not None:
+                self._set_prog(item.track_id, "done", 1.0,
+                               label=self._cache.get(item.track_id))
+                with self._ifl_lock:
+                    self._inflight.discard(item.track_id)
                 continue
 
-            for item in batch:
-                self._set_prog(item.track_id, "identifying", 0.2)
+            self._set_prog(item.track_id, "identifying", 0.2)
+            self._fire(item)
 
-            # ── Fire batch (no rate limiting — user controls server) ───────
-            self._fire(batch)
-
-    def _fire(self, batch: list[PendingItem]) -> None:
-        """Execute one batched API call and distribute results."""
-        for item in batch:
-            self._set_prog(item.track_id, "identifying", 0.5)
+    def _fire(self, item: PendingFrame) -> None:
+        """Execute one API call and distribute results."""
+        self._set_prog(item.track_id, "identifying", 0.5)
 
         try:
-            self.stats["requests"] += 1
-            results = self._client.identify_batch(batch)
+            # Encode frame to base64 JPEG
+            frame_b64 = _encode_frame(item.frame)
 
-            for item in batch:
-                label = results.get(item.track_id, item.class_name)
-                self._cache.set(item.track_id, label)
-                self._set_prog(item.track_id, "done", 1.0, label=label)
+            self.stats["requests"] += 1
+            results = self._client.identify_frame(frame_b64, item.track_ids)
+
+            # Update cache and progress for all tracks in the frame
+            for tid in item.track_ids:
+                label = results.get(tid, f"object #{tid}")
+                self._cache.set(tid, label)
+                self._set_prog(tid, "done", 1.0, label=label)
                 self.stats["identified"] += 1
-                print(f"[GemmaRemote] ✓ #{item.track_id} ({item.class_name}) "
-                      f"→ \"{_trunc(label, 60)}\"")
+                if tid == item.track_id:
+                    print(f"[RemoteLLM] ✓ #{tid} → \"{_trunc(label, 60)}\"")
 
         except Exception as exc:  # noqa: BLE001
             self.stats["errors"] += 1
             msg = _trunc(str(exc), 80)
-            print(f"[GemmaRemote] ✗ Error: {msg}")
-            for item in batch:
-                self._cache.set(item.track_id, item.class_name)
-                self._set_prog(item.track_id, "error", 1.0,
-                               label=item.class_name, error=msg)
+            print(f"[RemoteLLM] ✗ Error: {msg}")
+            # Fallback: set generic labels
+            for tid in item.track_ids:
+                self._cache.set(tid, f"object #{tid}")
+                self._set_prog(tid, "error", 1.0,
+                               label=f"object #{tid}", error=msg)
 
         finally:
             with self._ifl_lock:
-                for item in batch:
-                    self._inflight.discard(item.track_id)
+                self._inflight.discard(item.track_id)
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _set_prog(
         self,
         track_id: int,
-        status:   str,
+        status: str,
         progress: float,
-        label:    Optional[str] = None,
-        error:    Optional[str] = None,
+        label: Optional[str] = None,
+        error: Optional[str] = None,
     ) -> None:
         with self._prog_lock:
             prev = self.progress.get(track_id, {})
             self.progress[track_id] = {
-                "status":   status,
+                "status": status,
                 "progress": progress,
-                "label":    label if label is not None else prev.get("label"),
-                "error":    error,
+                "label": label if label is not None else prev.get("label"),
+                "error": error,
             }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper functions (same as id_service.py)
+# Helper functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _encode_crop(
-    crop: np.ndarray,
-    max_px:  int = MAX_CROP_PX,
+def _encode_frame(
+    frame: np.ndarray,
+    max_px: int = MAX_FRAME_PX,
     quality: int = JPEG_QUALITY,
 ) -> str:
-    """Resize and JPEG-encode a crop, return base64 string."""
-    h, w = crop.shape[:2]
+    """Resize and JPEG-encode a frame, return base64 string.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR frame from OpenCV.
+    max_px : int
+        Maximum dimension (width or height) — larger frames are resized.
+    quality : int
+        JPEG quality (0-100).
+
+    Returns
+    -------
+    str
+        Base64-encoded JPEG data URI.
+    """
+    h, w = frame.shape[:2]
+
+    # Resize if frame is too large (saves bandwidth)
     if max(h, w) > max_px:
         scale = max_px / max(h, w)
-        crop = cv2.resize(
-            crop,
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Encode to JPEG
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
+
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 

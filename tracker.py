@@ -36,15 +36,12 @@ from typing import Literal, Optional
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# supervision is MIT-licensed and ships ByteTrack
-try:
-    import supervision as sv
-    _SUPERVISION_AVAILABLE = False
-except ImportError:  # pragma: no cover
-    _SUPERVISION_AVAILABLE = False
-    sv = None  # type: ignore
+# ByteTrack is hardcoded disabled in this simplified architecture
+# Only CentroidTracker is used for pure CPU operation
+_SUPERVISION_AVAILABLE = False
+sv = None  # type: ignore
 
-from detector import DetectionResult
+from edge_detector import DetectionResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,29 +432,20 @@ def _batch_centroid_distance(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.nda
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tracker(
-    tracker_type: Literal["bytetrack", "centroid"] = "bytetrack",
+    tracker_type: Literal["bytetrack", "centroid"] = "centroid",
     **kwargs,
 ) -> Tracker:
-    """Return a Tracker instance by name.
+    """Return a Tracker instance.
+
+    In this simplified architecture, ByteTrack is hardcoded disabled.
+    Only CentroidTracker is available.
 
     Parameters
     ----------
     tracker_type : str
-        'bytetrack' (default) or 'centroid'.
+        Ignored — always returns CentroidTracker.
     **kwargs
         Passed to the tracker constructor.
-
-    To plug in a custom tracker:
-        1. Subclass ``Tracker``.
-        2. Add a new case here.
     """
-    if tracker_type == "bytetrack":
-        if _SUPERVISION_AVAILABLE:
-            return ByteTrackWrapper(**kwargs)
-        else:
-            print("[Tracker] supervision not available — falling back to CentroidTracker")
-            return CentroidTracker(**kwargs)
-    elif tracker_type == "centroid":
-        return CentroidTracker(**kwargs)
-    else:
-        raise ValueError(f"Unknown tracker type: {tracker_type!r}. Choose 'bytetrack' or 'centroid'.")
+    # ByteTrack is hardcoded disabled — always use CentroidTracker
+    return CentroidTracker(**kwargs)

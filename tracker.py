@@ -36,15 +36,16 @@ from typing import Literal, Optional
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# supervision is MIT-licensed and ships ByteTrack
+# Try to import supervision for ByteTrack support
+# Falls back to CentroidTracker if not available
 try:
     import supervision as sv
-    _SUPERVISION_AVAILABLE = False
+    _SUPERVISION_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _SUPERVISION_AVAILABLE = False
     sv = None  # type: ignore
 
-from detector import DetectionResult
+from edge_detector import DetectionResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,21 +436,22 @@ def _batch_centroid_distance(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.nda
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tracker(
-    tracker_type: Literal["bytetrack", "centroid"] = "bytetrack",
+    tracker_type: Literal["bytetrack", "centroid"] = "centroid",
     **kwargs,
 ) -> Tracker:
-    """Return a Tracker instance by name.
+    """Return a Tracker instance.
 
     Parameters
     ----------
     tracker_type : str
-        'bytetrack' (default) or 'centroid'.
+        'centroid' (default) or 'bytetrack'. ByteTrack requires supervision.
     **kwargs
         Passed to the tracker constructor.
 
-    To plug in a custom tracker:
-        1. Subclass ``Tracker``.
-        2. Add a new case here.
+    Returns
+    -------
+    Tracker
+        CentroidTracker or ByteTrackWrapper depending on availability and choice.
     """
     if tracker_type == "bytetrack":
         if _SUPERVISION_AVAILABLE:

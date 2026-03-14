@@ -2,15 +2,25 @@
 main.py — VisionTracker entry point.
 
 Orchestrates the full pipeline:
-  Camera → EdgeDetector → Tracker → IDService → UIOverlay
+  Camera → Detector → Tracker → IDService → UIOverlay
 
-For each tracked object, sends the full frame with ONLY that object's box
-drawn to the remote LLM server for identification.
+Two detectors are available (--detector flag):
+  edge  (default) — EdgeDetector: classic Canny/contour CV pipeline.
+                    No extra dependencies; works on any scene.
+  yolo            — YOLODetector: Ultralytics YOLO11/v8 inference.
+                    Much more accurate boxes + real class names from frame 1.
+                    Requires:  pip install ultralytics
+                    Model auto-downloaded on first run (~2.6 MB for yolo11n).
+
+In both modes, identification (what exactly is this object?) is optionally
+refined by the remote LLM via IDService — pass --remote-url to enable it.
 
 Run:
-  python main.py --remote-url https://xxx.ngrok.io
-  python main.py --remote-url https://xxx.ngrok.io --use-bg-removal
-  python main.py  # (no URL — runs without identification)
+  python main.py                                          # edge, no ID
+  python main.py --detector yolo                          # YOLO, no ID
+  python main.py --detector yolo --remote-url https://…  # YOLO + LLM ID
+  python main.py --remote-url https://xxx.ngrok.io       # edge + LLM ID
+  python main.py --input video.mp4 --detector yolo       # video file
 
 See README.md for full flag documentation.
 """
@@ -33,10 +43,11 @@ import numpy as np
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="VisionTracker — real-time edge detection, tracking, and LLM identification",
+        description="VisionTracker — real-time object detection, tracking, and LLM identification",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # Input
+
+    # ── Input ─────────────────────────────────────────────────────────────────
     p.add_argument("--input",  default="0",
                    help="Camera index (0) or path to video file")
     p.add_argument("--width",  type=int, default=1280)
@@ -45,30 +56,55 @@ def parse_args() -> argparse.Namespace:
                    help="Force grayscale display (faster on CPU). "
                         "Color frames are still sent to the ID service for accuracy.")
 
-    # Edge Detector
-    p.add_argument("--edge-min-area",   type=int,   default=500)
-    p.add_argument("--edge-max-area",   type=int,   default=100_000)
-    p.add_argument("--canny-low",       type=int,   default=50,
-                   help="Canny lower threshold (used when --no-auto-canny)")
-    p.add_argument("--canny-high",      type=int,   default=150,
-                   help="Canny upper threshold (used when --no-auto-canny)")
-    p.add_argument("--no-auto-canny",   action="store_true",
-                   help="Disable adaptive Canny thresholds and use --canny-low/--canny-high")
-    p.add_argument("--merge-distance",  type=int,   default=30,
-                   help="Pixel distance for proximity-based bounding-box merging "
-                        "(0 = disable; higher = more aggressive merging)")
-    p.add_argument("--close-kernel",    type=int,   default=15,
-                   help="Morphological close kernel size (larger bridges bigger gaps)")
-    p.add_argument("--use-bg-removal",  action="store_true",
-                   help="Enable background removal before edge detection (requires rembg)")
-    p.add_argument("--skip-frames",     type=int,   default=2,
-                   help="Run detector every N frames (1=every frame, 2=recommended for CPU)")
+    # ── Detector selection ────────────────────────────────────────────────────
+    p.add_argument("--detector", default="edge", choices=["edge", "yolo"],
+                   help="Detection backend: 'edge' (classic CV) or 'yolo' (Ultralytics YOLO)")
 
-    # Tracker
+    # ── YOLO-specific args ────────────────────────────────────────────────────
+    yolo = p.add_argument_group("YOLO detector (--detector yolo)")
+    yolo.add_argument("--yolo-model", default="yolo11n.pt",
+                      help="Ultralytics model name or local path. "
+                           "Auto-downloaded on first run. "
+                           "Examples: yolo11n.pt (fast), yolo11s.pt (accurate), yolov8n.pt")
+    yolo.add_argument("--yolo-conf", type=float, default=0.35,
+                      help="YOLO confidence threshold (0–1)")
+    yolo.add_argument("--yolo-iou",  type=float, default=0.45,
+                      help="YOLO NMS IoU threshold (0–1)")
+    yolo.add_argument("--yolo-imgsz", type=int, default=640,
+                      help="YOLO inference image size in pixels (320=faster, 640=standard)")
+    yolo.add_argument("--yolo-classes", type=int, nargs="*", default=None,
+                      help="Filter to specific COCO class IDs (e.g. --yolo-classes 0 2 7 "
+                           "for person + car + truck). Omit for all 80 classes.")
+    yolo.add_argument("--yolo-device", default="",
+                      help="Inference device: cpu, cuda, mps, or '' for auto-detect")
+
+    # ── Edge detector args ────────────────────────────────────────────────────
+    edge = p.add_argument_group("Edge detector (--detector edge)")
+    edge.add_argument("--edge-min-area",   type=int,   default=500)
+    edge.add_argument("--edge-max-area",   type=int,   default=100_000)
+    edge.add_argument("--canny-low",       type=int,   default=50,
+                      help="Canny lower threshold (used when --no-auto-canny)")
+    edge.add_argument("--canny-high",      type=int,   default=150,
+                      help="Canny upper threshold (used when --no-auto-canny)")
+    edge.add_argument("--no-auto-canny",   action="store_true",
+                      help="Disable adaptive Canny thresholds")
+    edge.add_argument("--merge-distance",  type=int,   default=30,
+                      help="Pixel distance for proximity-based box merging (0=disable)")
+    edge.add_argument("--close-kernel",    type=int,   default=15,
+                      help="Morphological close kernel size")
+    edge.add_argument("--use-bg-removal",  action="store_true",
+                      help="Enable rembg background removal before edge detection")
+
+    # ── Shared detector args ──────────────────────────────────────────────────
+    p.add_argument("--skip-frames", type=int, default=2,
+                   help="Run detector every N frames (1=every frame). "
+                        "Default 2 is recommended for CPU with both backends.")
+
+    # ── Tracker ───────────────────────────────────────────────────────────────
     p.add_argument("--tracker", default="bytetrack",
                    choices=["bytetrack", "centroid"])
 
-    # ID Service
+    # ── ID Service ────────────────────────────────────────────────────────────
     p.add_argument("--remote-url", default=None,
                    help="Remote LLM server URL (e.g., https://xxx.ngrok.io). "
                         "If omitted, identification is disabled.")
@@ -80,15 +116,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size",  type=int,   default=8)
     p.add_argument("--batch-wait",  type=int,   default=1000)
 
-    # UI
+    # ── UI ────────────────────────────────────────────────────────────────────
     p.add_argument("--show-velocity", action="store_true")
     p.add_argument("--no-display",    action="store_true",
                    help="Headless mode — no OpenCV window")
 
-    # Recording
+    # ── Recording ─────────────────────────────────────────────────────────────
     p.add_argument("--record-output", default=None,
-                   help="Save annotated video to this path (e.g., output.mp4). "
-                        "Uses mp4v codec. Recording adds minimal CPU overhead.")
+                   help="Save annotated video to this path (e.g., output.mp4)")
 
     return p.parse_args()
 
@@ -121,15 +156,11 @@ class FPSCounter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Null ID service (graceful no-op when no remote URL is configured)
+# Null ID service
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NullIdentificationService:
-    """Drop-in replacement for IdentificationService when no URL is set.
-
-    All methods are no-ops or return harmless defaults so the rest of the
-    pipeline runs normally — just without LLM identification.
-    """
+    """Drop-in no-op when no remote URL is configured."""
 
     def __init__(self) -> None:
         self.progress: dict[int, dict] = {}
@@ -184,7 +215,7 @@ def draw_frame_with_single_box(
 def main() -> int:
     args = parse_args()
 
-    from edge_detector import EdgeDetector
+    from edge_detector import build_detector
     from tracker import build_tracker
     from ui_overlay import UIOverlay
 
@@ -204,12 +235,14 @@ def main() -> int:
     else:
         id_service = NullIdentificationService()
 
-    # ── Build pipeline components ─────────────────────────────────────────────
     print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("  VisionTracker  —  starting")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-    detector = EdgeDetector(
+    # ── Build detector ────────────────────────────────────────────────────────
+    detector = build_detector(
+        args.detector,
+        # edge args
         min_area=args.edge_min_area,
         max_area=args.edge_max_area,
         canny_low=args.canny_low,
@@ -218,12 +251,20 @@ def main() -> int:
         merge_distance=args.merge_distance,
         close_kernel_size=args.close_kernel,
         use_bg_removal=args.use_bg_removal,
+        # yolo args
+        model_path=args.yolo_model,
+        conf_threshold=args.yolo_conf,
+        iou_threshold=args.yolo_iou,
+        imgsz=args.yolo_imgsz,
+        classes=args.yolo_classes,
+        device=args.yolo_device,
+        # shared
         skip_frames=args.skip_frames,
     )
 
-    tracker    = build_tracker(args.tracker)
-    overlay    = UIOverlay(show_velocity=args.show_velocity)
-    fps_ctr    = FPSCounter()
+    tracker = build_tracker(args.tracker)
+    overlay = UIOverlay(show_velocity=args.show_velocity)
+    fps_ctr = FPSCounter()
 
     # ── Open capture ──────────────────────────────────────────────────────────
     src = int(args.input) if args.input.isdigit() else args.input
@@ -238,9 +279,10 @@ def main() -> int:
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[Main] Capture: {frame_w}×{frame_h}")
-    print(f"[Main] Tracker: {tracker.name}")
-    print(f"[Main] ID interval: {args.id_interval}s")
+    print(f"[Main] Capture:   {frame_w}×{frame_h}")
+    print(f"[Main] Detector:  {args.detector}")
+    print(f"[Main] Tracker:   {tracker.name}")
+    print(f"[Main] ID:        {'enabled — ' + remote_url if remote_url else 'disabled'}")
     if not args.no_display:
         print("[Main] Press Q to quit.\n")
 
@@ -269,11 +311,9 @@ def main() -> int:
                 print("[Main] End of stream.")
                 break
 
-            # FIX: keep the original color frame separate from the display
-            # frame.  When --grayscale is active the old code sent a visually
-            # grey (but technically 3-channel) frame to the VLM, degrading
-            # identification quality.  Now the LLM always receives full color.
-            orig_frame = frame  # color, used for ID service
+            # Keep the original color frame for the ID service even when
+            # --grayscale is used for the local display.
+            orig_frame = frame
             display    = frame
             if args.grayscale:
                 g       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -288,10 +328,6 @@ def main() -> int:
             for tid in active_ids - current:
                 last_id_time.pop(tid, None)
             active_ids = current
-
-            # FIX: prune progress dict entries for tracks that are no longer
-            # visible.  Without this the dict grows without bound over a long
-            # session as new track IDs are continuously minted.
             id_service.cleanup_stale_progress(current)
 
             # Enqueue new identifications
@@ -301,7 +337,6 @@ def main() -> int:
                 last_t = last_id_time.get(tid, 0.0)
                 if (now - last_t > args.id_interval
                         and id_service.get_cached(tid) is None):
-                    # Use orig_frame (color) regardless of --grayscale flag
                     annotated = draw_frame_with_single_box(orig_frame, obj.xyxy)
                     if id_service.submit(track_id=tid, frame_with_box=annotated):
                         last_id_time[tid] = now
@@ -312,14 +347,14 @@ def main() -> int:
                 id_service.inject_cached(obj.track_id)
 
             # Render
-            fps        = fps_ctr.tick()
-            backend_s  = f"remote|q:{id_service.queue_depth()}" if remote_url else "disabled"
+            fps       = fps_ctr.tick()
+            backend_s = f"remote|q:{id_service.queue_depth()}" if remote_url else "disabled"
             annotated_frame = overlay.draw(
                 frame=display,
                 tracked_objects=tracked,
                 progress_dict=id_service.progress,
                 fps=fps,
-                mode="edge-llm",
+                mode=args.detector,
                 backend=backend_s,
             )
 

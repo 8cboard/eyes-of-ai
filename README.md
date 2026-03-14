@@ -1,18 +1,40 @@
-# VisionTracker — Real-Time Edge Detection, Tracking & LLM Identification
+# VisionTracker — Real-Time Object Detection, Tracking & LLM Identification
 
-VisionTracker detects objects via edge/contour detection, tracks them across frames,
-and uses a self-hosted remote VLM to identify what each object is.
+VisionTracker detects objects in real-time, tracks them across frames, and
+optionally uses a self-hosted remote VLM to give each track a refined
+identification label.
+
+Two detection backends are available:
+
+| Backend | Flag | Boxes | Class labels | Speed (CPU) |
+|---------|------|-------|--------------|-------------|
+| Edge (classic CV) | `--detector edge` | Good | "object" always | ~40–50 FPS |
+| **YOLO (recommended)** | `--detector yolo` | **Excellent** | **Real names from frame 1** | ~25–35 FPS |
+
+> **YOLO is the recommended backend.** It produces much tighter bounding boxes
+> and gives you real class names (person, car, laptop …) immediately, before
+> any LLM call.  The LLM identification layer is still available for finer
+> descriptions when needed.
 
 ---
 
 ## Architecture
 
 ```
-Camera → EdgeDetector → Tracker → per-object: draw single box → IDService (bg thread)
-                                                                      ↓
-                                                          Remote LLM /identify
-                                                                      ↓
-                                                              UIOverlay (OpenCV)
+Camera → Detector ──────────────────────────────────────────────────────────┐
+           │                                                                 │
+           │  EdgeDetector  — Bilateral → Canny → morph-close → merge       │
+           │  YOLODetector  — Ultralytics YOLO11/v8 inference               │
+           │                                                                 │
+           ▼                                                                 │
+        Tracker  (ByteTrack or CentroidTracker)                              │
+           │                                                                 │
+           ▼                                                                 │
+        IDService  (background thread, optional)                             │
+           │  per-object: draw green box → POST /identify to remote LLM     │
+           │  LLM refines the label (e.g. "person" → "person in blue jacket")│
+           ▼                                                                 │
+        UIOverlay  (OpenCV window / video writer) ◄───────────────────────── ┘
 ```
 
 ---
@@ -25,105 +47,68 @@ Camera → EdgeDetector → Tracker → per-object: draw single box → IDServic
 bash install.sh
 ```
 
-### 2 — Start the remote server (Kaggle P100 recommended)
-
-Open `remote_server/kaggle_setup.ipynb` and run all cells.
-It will print a URL like `https://abc123.ngrok.io`.
-
-### 3 — Run
+### 2 — Run with YOLO (no server needed)
 
 ```bash
-# With identification
-python main.py --remote-url https://abc123.ngrok.io
+# Webcam — YOLO detects + labels everything from frame 1
+python main.py --detector yolo
 
-# Camera-only (no identification)
-python main.py
+# Specific camera or video file
+python main.py --detector yolo --input 1
+python main.py --detector yolo --input video.mp4
 
-# Video file
-python main.py --input video.mp4 --remote-url https://abc123.ngrok.io
+# Record annotated video
+python main.py --detector yolo --record-output session.mp4
+```
 
-# Record the annotated output to a file
-python main.py --remote-url https://abc123.ngrok.io --record-output session.mp4
+### 3 — Add remote LLM identification (optional)
+
+Open `remote_server/kaggle_setup.ipynb`, run all cells, copy the URL.
+
+```bash
+python main.py --detector yolo --remote-url https://abc123.ngrok.io
 ```
 
 ---
 
-## Remote Server — Model
+## Detector Backends
 
-**LLaVA-1.6-Mistral-7B** (recommended — best quality under 10 GB, most stable GGUF)
+### YOLO  (`--detector yolo`)
 
-| File | Size | Source |
-|------|------|--------|
-| `llava-1.6-mistral-7b.Q4_K_M.gguf` | ~4.4 GB | [cjpais/llava-1.6-mistral-7b-gguf](https://huggingface.co/cjpais/llava-1.6-mistral-7b-gguf) |
-| `mmproj-model-f16.gguf` | ~631 MB | same repo |
-
-> ⚠️ **The mmproj (vision encoder) file is required.** Without it the model is
-> text-only and cannot see images. Pass `--mmproj-path` when starting the server.
-
-### Install llama-cpp-python (CUDA 12.1 prebuilt wheels)
+Uses Ultralytics YOLO11 (or v8) for detection.  The model is downloaded
+automatically on first run — no manual setup.
 
 ```bash
-# DO NOT use plain pip install — it compiles CPU-only from source
-pip install llama-cpp-python \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+# Default: YOLO11 nano — 2.6 MB, ~30 FPS on laptop CPU
+python main.py --detector yolo
 
-# Other CUDA versions: cu122  cu124  cu125  cpu (slow)
-# Full list: https://abetlen.github.io/llama-cpp-python/whl/
+# More accurate (slower):
+python main.py --detector yolo --yolo-model yolo11s.pt
+
+# Only detect people and cars (COCO class IDs 0 and 2):
+python main.py --detector yolo --yolo-classes 0 2
+
+# Lower confidence threshold to catch more objects:
+python main.py --detector yolo --yolo-conf 0.25
 ```
 
-### Start the server
+**Why YOLO for detection but not identification?**
+
+YOLO outputs one of 80 fixed COCO class names (person, car, dog …).  That is
+excellent for *detection* but not for *identification* — it cannot tell you
+which person, what breed of dog, or what model of laptop.  The remote LLM
+does that refinement job on demand, per object.
+
+### Edge  (`--detector edge`)
+
+Classic CV pipeline: Bilateral filter → adaptive Canny → morphological close
+→ proximity merge.  No extra dependencies, no model download.
 
 ```bash
-cd remote_server
-python server.py \
-    --model-path  /path/to/llava-1.6-mistral-7b.Q4_K_M.gguf \
-    --mmproj-path /path/to/mmproj-model-f16.gguf
-```
+python main.py --detector edge
 
-### API
-
-```
-GET  /health   → {"status":"healthy","model":"...","type":"gguf","version":"3.1.0"}
-
-POST /identify
-Body:   {"annotated_image": "<base64 JPEG>"}
-Return: {"result": "person"}   ← single common noun
-```
-
----
-
-## Edge Detection — How It Works
-
-The pipeline is designed for **indoor scenes** (desk, room, people):
-
-1. **Bilateral filter** — smooths fabric/wood texture noise while keeping hard edges
-2. **Adaptive Canny** — thresholds auto-calibrate using the scene's 10th–90th intensity
-   percentile span (works in dark rooms and bright scenes without hand-tuning)
-3. **Morphological close** — bridges gaps *inside* object outlines so each object becomes one filled shape
-4. **Proximity merge** — bounding boxes within N px of each other are unioned (fixes fragmentation)
-5. **Aspect-ratio filter** — drops thin-line noise (wires, shadows, furniture edges)
-
-### Key flags
-
-| Flag | Default | Effect |
-|------|---------|--------|
-| `--merge-distance 30` | 30 px | Increase for cluttered desks; decrease for well-separated objects |
-| `--close-kernel 15` | 15 px | Larger = bridges bigger outline gaps (try 20–25 for clothing) |
-| `--edge-min-area 500` | 500 px² | Raise to ignore small objects (phones, cups) |
-| `--no-auto-canny` | off | Use `--canny-low/--canny-high` manually instead of auto |
-| `--skip-frames 2` | 2 | Run detector every 2nd frame (CPU default; set to 1 for max accuracy) |
-
-### Indoor tuning presets
-
-```bash
-# Fine desk objects (small objects, close together)
-python main.py --merge-distance 20 --edge-min-area 300 --close-kernel 10
-
-# Room-scale scene (people, furniture)
-python main.py --merge-distance 40 --edge-min-area 1000 --close-kernel 20
-
-# Max accuracy (slower on CPU)
-python main.py --skip-frames 1 --merge-distance 30
+# Tuning:
+python main.py --detector edge --merge-distance 40 --edge-min-area 1000
 ```
 
 ---
@@ -135,40 +120,75 @@ python main.py --skip-frames 1 --merge-distance 30
 --input 0              Camera index or video file path
 --width 1280           Capture width
 --height 720           Capture height
---grayscale            Force grayscale display (color still used for LLM identification)
+--grayscale            Force grayscale display (ID service always gets color)
 ```
 
-### Edge Detector
+### Detector
+```
+--detector edge|yolo   Detection backend (default: edge)
+--skip-frames 2        Run detector every N frames (default 2, shared by both)
+```
+
+### YOLO options
+```
+--yolo-model yolo11n.pt   Model name or local path (auto-downloaded)
+--yolo-conf 0.35          Confidence threshold (lower = more detections)
+--yolo-iou 0.45           NMS IoU threshold
+--yolo-imgsz 640          Inference image size (320=faster, 640=default)
+--yolo-classes 0 2 7      Filter to specific COCO class IDs (omit for all 80)
+--yolo-device cpu|cuda    Force device (auto-detected if omitted)
+```
+
+### Edge detector options
 ```
 --edge-min-area 500    Minimum contour area (px²)
 --edge-max-area 100000 Maximum contour area
 --merge-distance 30    Proximity merge radius (px); 0 = disabled
 --close-kernel 15      Morphological close kernel size
 --no-auto-canny        Disable adaptive thresholds
---canny-low 50         Manual Canny low (--no-auto-canny)
---canny-high 150       Manual Canny high (--no-auto-canny)
---use-bg-removal       rembg background removal (slow but cleaner edges)
---skip-frames 2        Detect every N frames (default 2 for CPU)
+--canny-low 50         Manual Canny low threshold
+--canny-high 150       Manual Canny high threshold
+--use-bg-removal       Enable rembg background removal (requires rembg)
 ```
 
 ### Tracker
 ```
---tracker bytetrack    bytetrack (default) or centroid
+--tracker bytetrack|centroid   Tracker backend (default: bytetrack)
 ```
 
-### Identification
+### Identification (optional)
 ```
---remote-url URL       Remote server URL (omit to run without identification)
+--remote-url URL       Remote server URL (omit to disable identification)
 --remote-key KEY       Optional bearer token
 --id-ttl 45            Cache TTL in seconds
 --id-interval 5        Seconds between re-identification per track
 ```
 
-### UI & Output
+### Output
 ```
 --show-velocity        Show velocity indicator
 --no-display           Headless mode (no window)
---record-output PATH   Save annotated video to file (e.g. output.mp4)
+--record-output PATH   Save annotated video (e.g. output.mp4)
+```
+
+---
+
+## Remote Server — Model
+
+**LLaVA-1.6-Mistral-7B** (recommended)
+
+| File | Size | Source |
+|------|------|--------|
+| `llava-1.6-mistral-7b.Q4_K_M.gguf` | ~4.4 GB | [cjpais/llava-1.6-mistral-7b-gguf](https://huggingface.co/cjpais/llava-1.6-mistral-7b-gguf) |
+| `mmproj-model-f16.gguf` | ~631 MB | same repo |
+
+> ⚠️ The mmproj (vision encoder) file is required — without it the model is text-only.
+
+```bash
+cd remote_server
+python server.py \
+    --model-path  /path/to/llava-1.6-mistral-7b.Q4_K_M.gguf \
+    --mmproj-path /path/to/mmproj-model-f16.gguf
 ```
 
 ---
@@ -177,13 +197,26 @@ python main.py --skip-frames 1 --merge-distance 30
 
 | Config | Expected FPS |
 |--------|-------------|
-| CPU, ByteTrack, skip=2 | 25–40 |
-| CPU, Centroid, skip=2  | 30–45 |
-| CPU, ByteTrack, skip=1 | 15–25 |
-| With bg removal        | 10–15 |
+| YOLO nano, ByteTrack, skip=2 | 25–35 |
+| YOLO nano, Centroid, skip=2 | 30–40 |
+| YOLO small, ByteTrack, skip=2 | 15–25 |
+| Edge, ByteTrack, skip=2 | 35–50 |
+| Edge, Centroid, skip=2 | 40–55 |
 
-> **CPU tip:** `--skip-frames 2` (the default) halves edge-detection cost while the
-> tracker interpolates cleanly. For fast-moving scenes use `--skip-frames 1`.
+> `--skip-frames 2` (default) runs the detector on every other frame.
+> The tracker interpolates bounding boxes on skipped frames, so there is no
+> visible stutter at typical frame rates.
+
+---
+
+## COCO Class IDs (for --yolo-classes)
+
+Common IDs: `0` person · `1` bicycle · `2` car · `3` motorcycle · `5` bus ·
+`7` truck · `14` bird · `15` cat · `16` dog · `24` backpack · `26` handbag ·
+`39` bottle · `41` cup · `62` tv · `63` laptop · `64` mouse · `66` keyboard ·
+`67` phone · `73` book · `74` clock · `76` scissors
+
+Full list: https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml
 
 ---
 
@@ -193,7 +226,9 @@ python main.py --skip-frames 1 --merge-distance 30
 pytest tests/ -v
 ```
 
-All tests run offline with synthetic frames — no GPU, webcam, or internet needed.
+All tests run offline — no GPU, webcam, internet, or model download needed.
+YOLO is tested via a lightweight mock so `ultralytics` does not need to be
+installed in the test environment.
 
 ---
 

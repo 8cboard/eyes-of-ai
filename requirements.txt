@@ -16,11 +16,15 @@ numpy>=1.24.0
 supervision>=0.18.0        # ByteTrack wrapper (MIT)
 scipy>=1.11.0              # Hungarian algorithm for centroid tracker fallback
 
+# --- Detection: YOLO (optional but recommended) ---
+ultralytics>=8.3.0         # YOLOv8 / YOLO11 — required for --detector yolo
+                           # Models (yolo11n.pt etc.) are auto-downloaded on first run
+
 # --- Identification: Remote LLM ---
 requests>=2.31.0           # HTTP client for remote LLM server
 urllib3>=2.0.0
 
-# --- Optional: Background Removal ---
+# --- Optional: Background Removal (edge detector only) ---
 rembg>=2.0.50              # Optional: for --use-bg-removal flag
 onnxruntime>=1.15.0        # Required by rembg
 

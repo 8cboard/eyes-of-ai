@@ -391,57 +391,46 @@ def _identify_safetensors(image: Image.Image) -> str:
 def _parse_noun(text: str) -> str:
     """Normalise raw LLM output to a clean 1–3 word noun phrase.
 
-    Extended to strip more preamble phrases that models commonly produce
-    even when instructed to output the noun only.
+    Strips common control / image stream tokens (e.g. <im_startstream>, im_startstream)
+    and falls back to 'object' when nothing sensible remains.
     """
+    if not isinstance(text, str):
+        text = str(text)
+
+    # basic normalisation
     text = text.strip().lower()
     text = text.strip("\"'`")
     text = text.split("\n")[0].strip()
+
+    # Remove angle-bracketed image/control tokens like: <im_startstream>, </im_startstream>
+    text = re.sub(r"<\/?im_[^>\s]*>", "", text)
+
+    # Remove standalone control tokens like: im_startstream, im_end, im_start, im_endstream
+    text = re.sub(r"\bim_[a-z0-9_]+\b", "", text)
+
+    # Also remove any stray tokens that look like an image marker (common variants)
+    text = re.sub(r"\b(?:image_start|image_end|start_stream|end_stream)\b", "", text)
+
+    # Trim again and strip trailing punctuation
+    text = text.strip()
     text = re.sub(r"[.!?]+$", "", text).strip()
 
-    # Extended preamble list — order matters (longest/most specific first)
-    _PREAMBLES = (
-        "the object inside the green box is a ",
-        "the object inside the green box is an ",
-        "the object inside the green box is ",
-        "the object in the green box is a ",
-        "the object in the green box is an ",
-        "the object in the green box is ",
-        "the object in the box is a ",
-        "the object in the box is an ",
-        "the object in the box is ",
-        "the object is a ",
-        "the object is an ",
-        "the object is ",
-        "i can see a ",
-        "i can see an ",
-        "i can see ",
-        "i see a ",
-        "i see an ",
-        "i see ",
-        "this is a ",
-        "this is an ",
-        "this is ",
-        "it is a ",
-        "it is an ",
-        "it is ",
-        "that is a ",
-        "that is an ",
-        "that is ",
-        "looks like a ",
-        "looks like an ",
-        "looks like ",
-    )
-    for prefix in _PREAMBLES:
-        if text.startswith(prefix):
-            text = text[len(prefix):].strip()
-            break
-
+    # Remove any remaining non-word punctuation (allow hyphen)
     text = re.sub(r"[^\w\s\-]", "", text).strip()
+
+    # If nothing meaningful left, return generic fallback
+    if not text:
+        return "object"
+
+    # Some models still return short control-like words; guard against those
+    if len(text) <= 20 and re.match(r"^(im_|image|start|end|<.*>$)", text):
+        return "object"
+
+    # Remove long non-word garbage and cap words at 3
     words = text.split()
     if not words or len(words) > 4:
         return "object"
-    return " ".join(words[:3])  # cap at 3 words
+    return " ".join(words[:3])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

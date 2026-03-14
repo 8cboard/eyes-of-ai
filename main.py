@@ -42,7 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width",  type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--grayscale", action="store_true",
-                   help="Force grayscale (faster on CPU)")
+                   help="Force grayscale display (faster on CPU). "
+                        "Color frames are still sent to the ID service for accuracy.")
 
     # Edge Detector
     p.add_argument("--edge-min-area",   type=int,   default=500)
@@ -60,8 +61,8 @@ def parse_args() -> argparse.Namespace:
                    help="Morphological close kernel size (larger bridges bigger gaps)")
     p.add_argument("--use-bg-removal",  action="store_true",
                    help="Enable background removal before edge detection (requires rembg)")
-    p.add_argument("--skip-frames",     type=int,   default=1,
-                   help="Run detector every N frames (1=every frame)")
+    p.add_argument("--skip-frames",     type=int,   default=2,
+                   help="Run detector every N frames (1=every frame, 2=recommended for CPU)")
 
     # Tracker
     p.add_argument("--tracker", default="bytetrack",
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show-velocity", action="store_true")
     p.add_argument("--no-display",    action="store_true",
                    help="Headless mode — no OpenCV window")
+
+    # Recording
+    p.add_argument("--record-output", default=None,
+                   help="Save annotated video to this path (e.g., output.mp4). "
+                        "Uses mp4v codec. Recording adds minimal CPU overhead.")
 
     return p.parse_args()
 
@@ -141,6 +147,9 @@ class NullIdentificationService:
         return 0
 
     def inject_cached(self, track_id: int) -> None:
+        pass
+
+    def cleanup_stale_progress(self, current_ids: set[int]) -> None:
         pass
 
     def shutdown(self) -> None:
@@ -227,11 +236,27 @@ def main() -> int:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    print(f"[Main] Capture: {int(cap.get(3))}×{int(cap.get(4))}")
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[Main] Capture: {frame_w}×{frame_h}")
     print(f"[Main] Tracker: {tracker.name}")
     print(f"[Main] ID interval: {args.id_interval}s")
     if not args.no_display:
         print("[Main] Press Q to quit.\n")
+
+    # ── Video writer (optional) ───────────────────────────────────────────────
+    writer: Optional[cv2.VideoWriter] = None
+    if args.record_output:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            args.record_output, fourcc, 30.0, (frame_w, frame_h)
+        )
+        if writer.isOpened():
+            print(f"[Main] Recording to: {args.record_output}")
+        else:
+            print(f"[Main] WARNING: Could not open video writer for {args.record_output}",
+                  file=sys.stderr)
+            writer = None
 
     active_ids:   set[int]         = set()
     last_id_time: dict[int, float] = {}
@@ -244,9 +269,14 @@ def main() -> int:
                 print("[Main] End of stream.")
                 break
 
-            display = frame
+            # FIX: keep the original color frame separate from the display
+            # frame.  When --grayscale is active the old code sent a visually
+            # grey (but technically 3-channel) frame to the VLM, degrading
+            # identification quality.  Now the LLM always receives full color.
+            orig_frame = frame  # color, used for ID service
+            display    = frame
             if args.grayscale:
-                g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                g       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 display = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
             # Detect + track
@@ -259,14 +289,20 @@ def main() -> int:
                 last_id_time.pop(tid, None)
             active_ids = current
 
+            # FIX: prune progress dict entries for tracks that are no longer
+            # visible.  Without this the dict grows without bound over a long
+            # session as new track IDs are continuously minted.
+            id_service.cleanup_stale_progress(current)
+
             # Enqueue new identifications
             now = time.monotonic()
             for obj in tracked:
-                tid = obj.track_id
+                tid    = obj.track_id
                 last_t = last_id_time.get(tid, 0.0)
                 if (now - last_t > args.id_interval
                         and id_service.get_cached(tid) is None):
-                    annotated = draw_frame_with_single_box(display, obj.xyxy)
+                    # Use orig_frame (color) regardless of --grayscale flag
+                    annotated = draw_frame_with_single_box(orig_frame, obj.xyxy)
                     if id_service.submit(track_id=tid, frame_with_box=annotated):
                         last_id_time[tid] = now
                         print(f"[Main] → queued #{tid} | q={id_service.queue_depth()}")
@@ -287,6 +323,9 @@ def main() -> int:
                 backend=backend_s,
             )
 
+            if writer is not None:
+                writer.write(annotated_frame)
+
             if not args.no_display:
                 cv2.imshow("VisionTracker", annotated_frame)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
@@ -298,6 +337,9 @@ def main() -> int:
     finally:
         print("[Main] Cleaning up…")
         cap.release()
+        if writer is not None:
+            writer.release()
+            print(f"[Main] Video saved to: {args.record_output}")
         if not args.no_display:
             cv2.destroyAllWindows()
         id_service.shutdown()

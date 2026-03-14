@@ -143,21 +143,40 @@ def _auto_canny_thresholds(
     gray: np.ndarray,
     sigma: float = 0.33,
 ) -> tuple[int, int]:
-    """Compute Canny thresholds from the image median (auto-tuning heuristic).
+    """Compute Canny thresholds from scene intensity percentiles.
 
-    Uses ``median ± sigma * median`` so the detector adapts to scene
-    brightness without hand-tuning.
+    FIX: uses the 10th-90th percentile span instead of the raw median.
+    The old raw-median approach collapsed to (0, 0) on near-black frames
+    (median=0 → low=-10→0, high=10) and flooded detection because almost
+    every pixel crossed that tiny threshold.  Anchoring on the inner-80%
+    intensity range gives a stable signal in all lighting conditions.
+
+    Parameters
+    ----------
+    gray   : uint8 grayscale image
+    sigma  : spread factor around the anchor value
 
     Returns
     -------
     (low, high) integer thresholds for cv2.Canny.
     """
-    median = float(np.median(gray))
-    low  = max(0,   int((1.0 - sigma) * median))
-    high = min(255, int((1.0 + sigma) * median))
-    if high - low < 20:
-        low  = max(0,   low  - 10)
-        high = min(255, high + 10)
+    p_lo   = float(np.percentile(gray, 10))
+    p_hi   = float(np.percentile(gray, 90))
+    anchor = (p_lo + p_hi) / 2.0
+
+    # Clamp anchor to a range that always produces meaningful edges.
+    anchor = max(30.0, min(anchor, 220.0))
+
+    low  = max(0,   int((1.0 - sigma) * anchor))
+    high = min(255, int((1.0 + sigma) * anchor))
+
+    # Guarantee a minimum gap so Canny is neither over- nor under-selective.
+    min_gap = 20
+    if high - low < min_gap:
+        half = min_gap // 2
+        low  = max(0,   low  - half)
+        high = min(255, high + half)
+
     return low, high
 
 
@@ -181,7 +200,9 @@ class EdgeDetector:
         Strongly recommended for real-world scenes.  Default: True.
     bilateral_d : int
         Diameter of the bilateral filter neighbourhood.  Larger = more
-        texture smoothing but slower.  Set to 0 to disable.
+        texture smoothing but slower.  Default is 5 (CPU-friendly).
+        Going from 9 to 5 is roughly 3x faster at the cost of slightly
+        less texture suppression.  Set to 0 to disable.
     close_kernel_size : int
         Side length of the elliptical morphological-close kernel that
         bridges gaps in object outlines.  Larger = more gap bridging.
@@ -193,6 +214,10 @@ class EdgeDetector:
         Pixel proximity threshold for bounding-box merging.  Any two boxes
         whose borders are closer than this value are merged into one.
         Set to 0 to disable merging entirely.
+    max_detections : int
+        Hard cap on pre-merge raw contour boxes (default 80).  Prevents
+        O(n²) slowdowns in heavily cluttered scenes; the largest boxes
+        (most likely to be real objects) are kept.
     min_box_dim : int
         Minimum width *and* height for a box after merging.
     max_aspect : float
@@ -201,6 +226,7 @@ class EdgeDetector:
         Use rembg background removal before edge detection.
     skip_frames : int
         Run detection every N frames; return cached result otherwise.
+        Detection always runs on frame 1 regardless of this value.
     """
 
     def __init__(
@@ -210,11 +236,12 @@ class EdgeDetector:
         canny_low: int = 50,
         canny_high: int = 150,
         auto_canny: bool = True,
-        bilateral_d: int = 9,
+        bilateral_d: int = 5,           # was 9 — ~3x faster on CPU
         close_kernel_size: int = 15,
         close_iterations: int = 2,
         dilate_iterations: int = 1,
         merge_distance: int = 30,
+        max_detections: int = 80,       # cap before O(n²) merge
         min_box_dim: int = 20,
         max_aspect: float = 10.0,
         use_bg_removal: bool = False,
@@ -230,6 +257,7 @@ class EdgeDetector:
         self.close_iterations  = close_iterations
         self.dilate_iterations = dilate_iterations
         self.merge_distance    = merge_distance
+        self.max_detections    = max(1, max_detections)
         self.min_box_dim       = min_box_dim
         self.max_aspect        = max_aspect
         self.use_bg_removal    = use_bg_removal
@@ -260,10 +288,11 @@ class EdgeDetector:
 
         print(
             f"[EdgeDetector] area=[{min_area},{max_area}] "
-            f"canny={'auto' if auto_canny else f'({canny_low},{canny_high})'} "
+            f"canny={'auto(percentile)' if auto_canny else f'({canny_low},{canny_high})'} "
             f"bilateral_d={bilateral_d} "
             f"close={close_kernel_size}px×{close_iterations} "
             f"merge={merge_distance}px "
+            f"max_det={self.max_detections} "
             f"skip={skip_frames}"
         )
 
@@ -284,7 +313,10 @@ class EdgeDetector:
         import time
         self._frame_counter += 1
 
-        if (self._frame_counter % self.skip_frames) != 0:
+        # FIX: use (counter-1) so detection runs on frame 1, 1+N, 1+2N ...
+        # The old `counter % N != 0` skipped frame 1 entirely when N > 1,
+        # giving an empty result on the very first displayed frame.
+        if self.skip_frames > 1 and (self._frame_counter - 1) % self.skip_frames != 0:
             return self._last_result
 
         t0 = time.perf_counter()
@@ -374,13 +406,21 @@ class EdgeDetector:
         if not raw_boxes:
             return DetectionResult()
 
-        # 10. Proximity merge — unites fragments of the same object
+        # 10. Cap raw boxes before the O(n²) merge to protect CPU budgets.
+        #     Sort descending by area so the most prominent objects survive.
+        if len(raw_boxes) > self.max_detections:
+            raw_boxes.sort(
+                key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True
+            )
+            raw_boxes = raw_boxes[: self.max_detections]
+
+        # 11. Proximity merge — unites fragments of the same object
         merged = (
             _merge_boxes_by_proximity(raw_boxes, self.merge_distance)
             if self.merge_distance > 0 else raw_boxes
         )
 
-        # 11. Post-merge quality filter
+        # 12. Post-merge quality filter
         frame_area = w_frame * h_frame
         max_post   = min(self.max_area * 4, int(frame_area * 0.90))
 

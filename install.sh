@@ -52,21 +52,29 @@ pip install -r requirements.txt
 echo ""
 echo "[3/3] Verifying installation..."
 python3 -c "
-import cv2, numpy, supervision, scipy
+import cv2, numpy, scipy
 print('  ✓ opencv   ', cv2.__version__)
 print('  ✓ numpy    ', numpy.__version__)
-print('  ✓ supervision loaded')
 print('  ✓ scipy loaded')
+try:
+    import supervision
+    print('  ✓ supervision loaded (ByteTrack available)')
+except ImportError:
+    print('  ⚠ supervision not found — CentroidTracker will be used as fallback')
 "
 
 echo ""
 echo "============================================"
 echo "  Client installation complete!"
 echo ""
-echo "  To run without identification (camera-only):"
+echo "  Camera-only (no identification):"
 echo "    python main.py"
 echo ""
-echo "  To run with remote LLM identification:"
-echo "    1. Set up the remote server (see remote_server/README.md)"
-echo "    2. python main.py --remote-url https://your-server.ngrok.io"
+echo "  With remote LLM identification:"
+echo "    python main.py --remote-url https://your-server.ngrok.io"
+echo ""
+echo "  Record annotated video:"
+echo "    python main.py --record-output session.mp4"
+echo ""
+echo "  For remote server setup, see: remote_server/README.md"
 echo "============================================"

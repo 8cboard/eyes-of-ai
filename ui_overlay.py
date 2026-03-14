@@ -140,6 +140,7 @@ class UIOverlay:
         progress_dict: dict,
         velocities: Optional[dict[int, float]],
     ) -> None:
+        h_frame, w_frame = frame.shape[:2]
         color = _color(obj.track_id)
         x1, y1, x2, y2 = obj.xyxy.astype(int)
 
@@ -181,17 +182,15 @@ class UIOverlay:
         if vel_line:
             lines.append(vel_line)
 
-        self._draw_label_block(frame, x1, y1, lines, color)
+        self._draw_label_block(frame, x1, y1, lines, color, w_frame)
 
         # ── Progress bar (while identifying) ──────────────────────────────
         if status in ("identifying", "queued") and (x2 - x1) > 20:
-            self._draw_progress_bar(frame, x1, y2, x2, progress_val, color)
+            self._draw_progress_bar(frame, x1, y2, x2, progress_val, color, h_frame)
 
-        # ── Still indicator (green dot) ────────────────────────────────────
-        if status == "idle":
-            pass  # No indicator when idle
-        elif status == "done":
-            cv2.circle(frame, (x1 + 6, y1 + 6), 4, (0, 220, 0), -1)  # green
+        # ── Status indicator dot ───────────────────────────────────────────
+        if status == "done":
+            cv2.circle(frame, (x1 + 6, y1 + 6), 4, (0, 220, 0), -1)   # green
         elif status in ("identifying", "queued"):
             cv2.circle(frame, (x1 + 6, y1 + 6), 4, (0, 165, 255), -1)  # orange
 
@@ -202,18 +201,25 @@ class UIOverlay:
         y1: int,
         lines: list[str],
         color: tuple[int, int, int],
+        frame_width: int,
     ) -> None:
         """Draw a semi-transparent background rectangle and text lines above the box."""
+        if not lines:
+            return
+
         fs = self.font_scale
         pad = 4
         line_height = int(18 * fs + 4)
         block_h = line_height * len(lines) + pad * 2
-        block_w = max(
+
+        # Compute natural block width from text, then clamp to frame.
+        natural_w = max(
             cv2.getTextSize(line, self._font, fs, 1)[0][0] for line in lines
         ) + pad * 2
+        block_w = min(natural_w, frame_width)  # FIX: never exceed frame width
 
-        # Clamp so label stays within frame
-        lx = max(0, x1)
+        # Clamp left edge so label stays within frame
+        lx = max(0, min(x1, frame_width - block_w))
         ly = max(block_h, y1) - block_h
 
         # Semi-transparent background
@@ -238,12 +244,18 @@ class UIOverlay:
         x2: int,
         progress: float,
         color: tuple[int, int, int],
+        frame_height: int,
     ) -> None:
         """Draw a thin progress bar along the bottom edge of the bounding box."""
-        bar_h = 5
+        bar_h  = 5
         bar_y1 = y2
-        bar_y2 = y2 + bar_h
-        bar_w = x2 - x1
+        # FIX: clamp bar_y2 so it never paints outside the frame bottom,
+        # which caused an OpenCV assertion failure when the box touched the edge.
+        bar_y2 = min(y2 + bar_h, frame_height)
+        if bar_y2 <= bar_y1:
+            return
+
+        bar_w    = x2 - x1
         filled_w = int(bar_w * min(1.0, max(0.0, progress)))
 
         # Background

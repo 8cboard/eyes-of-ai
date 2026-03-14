@@ -55,7 +55,10 @@ RETRY_BASE_DELAY_S = 2.0
 
 # Image encoding
 JPEG_QUALITY = 85
-MAX_FRAME_SIZE = 1280  # Longest edge for annotated frame
+# FIX: reduced from 1280 → 800.  A VLM can identify common objects at 800px
+# easily, and this cuts JPEG payload size by ~60%, meaningfully reducing
+# network round-trip time to Colab/Kaggle free-tier tunnels.
+MAX_FRAME_SIZE = 800
 
 
 @dataclass(order=True)
@@ -156,6 +159,10 @@ class RemoteLLMClient:
             print(f"[IDService] Health check warning: {exc}")
             print(f"[IDService] Server may still be starting up...")
 
+    def close(self) -> None:
+        """Release the underlying HTTP session."""
+        self._session.close()
+
     def _headers(self) -> dict[str, str]:
         """Build request headers with optional auth."""
         headers = {"Content-Type": "application/json"}
@@ -182,7 +189,6 @@ class RemoteLLMClient:
         str
             Single common noun describing the object
         """
-        # Encode frame to base64 JPEG
         img_b64 = _encode_frame(frame)
 
         payload = {
@@ -204,7 +210,6 @@ class RemoteLLMClient:
                 data = resp.json()
                 result = data.get("result", "object")
 
-                # Validate: should be a single common noun
                 if not result or not isinstance(result, str):
                     result = "object"
 
@@ -252,18 +257,20 @@ class IdentificationService:
         self._client = RemoteLLMClient(base_url=remote_url, api_key=api_key)
         self._cache = IdentificationCache(ttl_seconds=cache_ttl)
 
-        # Shared progress dict
+        # Shared progress dict — written by dispatcher, read by main thread.
+        # CPython's GIL makes dict reads safe in practice without a read lock,
+        # but all writes go through _prog_lock for correctness.
         self.progress: dict[int, dict] = {}
         self._prog_lock = threading.Lock()
 
         # Priority queue
         self._q: queue.PriorityQueue[PendingItem] = queue.PriorityQueue()
 
-        # Track which track_ids are currently queued or in-flight
+        # Track which track_ids are currently in-flight
         self._inflight: set[int] = set()
         self._ifl_lock = threading.Lock()
 
-        # Counters
+        # Stats — written only from the dispatcher thread, so no extra lock needed.
         self.stats = dict(requests=0, identified=0, errors=0, retries=0)
 
         # Start dispatcher thread
@@ -275,7 +282,7 @@ class IdentificationService:
 
         print(f"[IDService] Remote LLM identification (single object mode)")
         print(f"[IDService] Server: {remote_url}")
-        print(f"[IDService] Cache TTL: {cache_ttl}s")
+        print(f"[IDService] Cache TTL: {cache_ttl}s  |  Max frame size: {MAX_FRAME_SIZE}px")
 
     def get_cached(self, track_id: int) -> Optional[str]:
         """Return cached label or None if not yet identified / expired."""
@@ -295,28 +302,36 @@ class IdentificationService:
             The track ID of the object in the frame.
         frame_with_box : np.ndarray
             Full frame with only this object's bounding box drawn.
+            Must already be a fresh copy — this method does NOT copy it again.
         priority : float, optional
             Priority for queue ordering (lower = earlier).
 
         Returns True if enqueued, False if track already in-flight or cached.
         """
-        # Check if already cached or in-flight
+        # FIX: check cache BEFORE acquiring _ifl_lock.  The old code held
+        # _ifl_lock while calling _cache.get(), nesting locks unnecessarily
+        # and increasing contention with the dispatcher thread.  The fast-path
+        # check here is intentionally racy (no lock) — worst case we do one
+        # redundant request, which the dispatcher discards on its own cache
+        # re-check before firing.
+        if self._cache.get(track_id) is not None:
+            return False
+
         with self._ifl_lock:
-            if self._cache.get(track_id) is not None:
-                return False
             if track_id in self._inflight:
                 return False
             self._inflight.add(track_id)
 
+        # FIX: do NOT call frame_with_box.copy() here.  The caller
+        # (draw_frame_with_single_box) already returns a fresh copy, so a
+        # second copy here is pure waste (~2 MB × N tracks per cycle on CPU).
         item = PendingItem(
             priority=priority if priority is not None else time.monotonic(),
             track_id=track_id,
-            frame=frame_with_box.copy(),
+            frame=frame_with_box,
         )
         self._q.put(item)
-
         self._set_prog(track_id, "queued", 0.0)
-
         return True
 
     def queue_depth(self) -> int:
@@ -328,6 +343,17 @@ class IdentificationService:
         if label is not None:
             self._set_prog(track_id, "done", 1.0, label=label)
 
+    def cleanup_stale_progress(self, current_ids: set[int]) -> None:
+        """Remove progress entries for track IDs no longer being tracked.
+
+        Call once per frame with the set of currently active track IDs.
+        Prevents the progress dict from growing without bound over long runs.
+        """
+        with self._prog_lock:
+            stale = [k for k in self.progress if k not in current_ids]
+            for k in stale:
+                del self.progress[k]
+
     def shutdown(self) -> None:
         """Stop the dispatcher thread gracefully."""
         self._alive = False
@@ -336,6 +362,7 @@ class IdentificationService:
             frame=np.zeros((1, 1, 3), np.uint8),
         ))
         self._thread.join(timeout=3.0)
+        self._client.close()
 
     def _dispatch_loop(self) -> None:
         """Process items from the queue and send to remote server."""
@@ -349,7 +376,7 @@ class IdentificationService:
             if item.track_id < 0:  # stop sentinel
                 break
 
-            # Skip if already identified while waiting
+            # Skip if already identified while waiting in queue
             if self._cache.get(item.track_id) is not None:
                 with self._ifl_lock:
                     self._inflight.discard(item.track_id)

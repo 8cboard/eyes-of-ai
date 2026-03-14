@@ -41,6 +41,9 @@ python main.py
 
 # Video file
 python main.py --input video.mp4 --remote-url https://abc123.ngrok.io
+
+# Record the annotated output to a file
+python main.py --remote-url https://abc123.ngrok.io --record-output session.mp4
 ```
 
 ---
@@ -80,7 +83,7 @@ python server.py \
 ### API
 
 ```
-GET  /health   → {"status":"healthy","model":"...","type":"gguf","version":"3.0.0"}
+GET  /health   → {"status":"healthy","model":"...","type":"gguf","version":"3.1.0"}
 
 POST /identify
 Body:   {"annotated_image": "<base64 JPEG>"}
@@ -94,7 +97,8 @@ Return: {"result": "person"}   ← single common noun
 The pipeline is designed for **indoor scenes** (desk, room, people):
 
 1. **Bilateral filter** — smooths fabric/wood texture noise while keeping hard edges
-2. **Adaptive Canny** — thresholds auto-calibrate to the scene's brightness (no hand-tuning)
+2. **Adaptive Canny** — thresholds auto-calibrate using the scene's 10th–90th intensity
+   percentile span (works in dark rooms and bright scenes without hand-tuning)
 3. **Morphological close** — bridges gaps *inside* object outlines so each object becomes one filled shape
 4. **Proximity merge** — bounding boxes within N px of each other are unioned (fixes fragmentation)
 5. **Aspect-ratio filter** — drops thin-line noise (wires, shadows, furniture edges)
@@ -107,7 +111,7 @@ The pipeline is designed for **indoor scenes** (desk, room, people):
 | `--close-kernel 15` | 15 px | Larger = bridges bigger outline gaps (try 20–25 for clothing) |
 | `--edge-min-area 500` | 500 px² | Raise to ignore small objects (phones, cups) |
 | `--no-auto-canny` | off | Use `--canny-low/--canny-high` manually instead of auto |
-| `--skip-frames 2` | 1 | Run detector every 2nd frame for better FPS |
+| `--skip-frames 2` | 2 | Run detector every 2nd frame (CPU default; set to 1 for max accuracy) |
 
 ### Indoor tuning presets
 
@@ -118,8 +122,8 @@ python main.py --merge-distance 20 --edge-min-area 300 --close-kernel 10
 # Room-scale scene (people, furniture)
 python main.py --merge-distance 40 --edge-min-area 1000 --close-kernel 20
 
-# Fast mode (CPU)
-python main.py --skip-frames 2 --tracker centroid --merge-distance 30
+# Max accuracy (slower on CPU)
+python main.py --skip-frames 1 --merge-distance 30
 ```
 
 ---
@@ -131,7 +135,7 @@ python main.py --skip-frames 2 --tracker centroid --merge-distance 30
 --input 0              Camera index or video file path
 --width 1280           Capture width
 --height 720           Capture height
---grayscale            Force grayscale
+--grayscale            Force grayscale display (color still used for LLM identification)
 ```
 
 ### Edge Detector
@@ -144,7 +148,7 @@ python main.py --skip-frames 2 --tracker centroid --merge-distance 30
 --canny-low 50         Manual Canny low (--no-auto-canny)
 --canny-high 150       Manual Canny high (--no-auto-canny)
 --use-bg-removal       rembg background removal (slow but cleaner edges)
---skip-frames 1        Detect every N frames
+--skip-frames 2        Detect every N frames (default 2 for CPU)
 ```
 
 ### Tracker
@@ -160,10 +164,11 @@ python main.py --skip-frames 2 --tracker centroid --merge-distance 30
 --id-interval 5        Seconds between re-identification per track
 ```
 
-### UI
+### UI & Output
 ```
 --show-velocity        Show velocity indicator
 --no-display           Headless mode (no window)
+--record-output PATH   Save annotated video to file (e.g. output.mp4)
 ```
 
 ---
@@ -172,9 +177,13 @@ python main.py --skip-frames 2 --tracker centroid --merge-distance 30
 
 | Config | Expected FPS |
 |--------|-------------|
-| CPU, ByteTrack, skip=1 | 20–30 |
-| CPU, Centroid, skip=2 | 30–45 |
-| With bg removal | 10–15 |
+| CPU, ByteTrack, skip=2 | 25–40 |
+| CPU, Centroid, skip=2  | 30–45 |
+| CPU, ByteTrack, skip=1 | 15–25 |
+| With bg removal        | 10–15 |
+
+> **CPU tip:** `--skip-frames 2` (the default) halves edge-detection cost while the
+> tracker interpolates cleanly. For fast-moving scenes use `--skip-frames 1`.
 
 ---
 

@@ -91,7 +91,7 @@ Write-Host "============================================" -ForegroundColor Green
 Write-Host "  Installation complete!" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "To use VisionTracker:"
+Write-Host "To use VisionTracker:" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  1. Activate the virtual environment:" -ForegroundColor Cyan
 Write-Host "     .venv\Scripts\Activate.ps1"
@@ -101,11 +101,16 @@ Write-Host ""
 Write-Host "  3. Run VisionTracker:" -ForegroundColor Cyan
 Write-Host "     python main.py --remote-url https://your-server-url"
 Write-Host ""
+Write-Host "  Record annotated video:" -ForegroundColor Cyan
+Write-Host "     python main.py --remote-url https://your-server-url --record-output session.mp4"
+Write-Host ""
 Write-Host "  Or with test video:" -ForegroundColor Cyan
 Write-Host "     python main.py --input test_video.mp4 --remote-url https://your-server-url"
 Write-Host ""
 Write-Host "Optional flags:" -ForegroundColor Cyan
+Write-Host "     --skip-frames 2     Run detector every 2nd frame (CPU default)"
 Write-Host "     --use-bg-removal    Enable background removal (requires rembg)"
 Write-Host "     --edge-min-area 500 Filter small contours"
 Write-Host "     --id-interval 5     Identification interval in seconds"
+Write-Host "     --record-output     Save annotated video to file"
 Write-Host ""

@@ -275,87 +275,127 @@ _PROMPT = (
 
 
 def _identify_gguf(image: Image.Image) -> str:
+    """Robust GGUF identify: try two prompt formats and defensive parsing."""
     img_buf = io.BytesIO()
     image.save(img_buf, format="JPEG", quality=90)
     img_b64 = base64.b64encode(img_buf.getvalue()).decode()
 
-    messages = [
+    STOP_TOKENS = ["</s>", "\n", "<|im_end|>", "<|endoftext|>"]
+
+    def _call_model(messages, max_tokens=40):
+        try:
+            resp = _model.create_chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.1,
+                stop=STOP_TOKENS,
+            )
+        except Exception as exc:
+            print("[_identify_gguf] create_chat_completion raised:", exc)
+            raise
+        # guard: if not dict, wrap it so parsing code doesn't blow up
+        if not isinstance(resp, dict):
+            print("[_identify_gguf] Non-dict raw response from create_chat_completion:")
+            print(resp)
+            resp = {"choices": [{"message": {"content": str(resp)}}]}
+        return resp
+
+    def _extract_raw(resp):
+        """Extract a plain string from various llama-cpp response shapes."""
+        try:
+            choice0 = resp.get("choices", [{}])[0]
+            # support both 'message' dict and older 'text' placements
+            if isinstance(choice0, dict) and "message" in choice0:
+                message = choice0.get("message", {}) or {}
+                content = message.get("content", "")
+            else:
+                content = choice0.get("text", "") if isinstance(choice0, dict) else ""
+            raw_text = ""
+            if isinstance(content, str):
+                raw_text = content
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        t = part.get("text") or part.get("content")
+                        if t:
+                            parts.append(str(t))
+                    elif isinstance(part, str):
+                        parts.append(part)
+                raw_text = " ".join(parts)
+            elif isinstance(content, dict):
+                raw_text = content.get("text") or content.get("content") or str(content)
+            else:
+                raw_text = str(content)
+            return raw_text.strip()
+        except Exception:
+            print("[_identify_gguf] Failed to extract text from resp (full resp below):")
+            print(resp)
+            return ""
+
+    def _is_control_or_garbage(s: str) -> bool:
+        if not s:
+            return True
+        s0 = s.strip().lower()
+        # common control tokens / roles we want to reject
+        if re.fullmatch(r"[<]*im_[a-z0-9_<>]*[>]*", s0):
+            return True
+        if s0 in ("system", "assistant", "user"):
+            return True
+        if s0 in ("im_startstream", "im_endstream", "im_start", "im_end", "image_start", "image_end"):
+            return True
+        # also reject purely numeric or extremely long garbage
+        if re.fullmatch(r"^\s*\d+\s*$", s0):
+            return True
+        return False
+
+    # Strategy 1: simple text message embedding a data URI (works for chatml/chat-format handlers)
+    messages1 = [
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": _PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-            ],
+            "content": f"{_PROMPT}\n[data:image/jpeg;base64,{img_b64}]"
         }
     ]
 
     try:
-        resp = _model.create_chat_completion(
-            messages=messages,
-            max_tokens=30,
-            temperature=0.1,
-            stop=["</s>", "\n", "<|im_end|>", "<|endoftext|>"],
-        )
-    except Exception as exc:
-        # Bubble up with a clear message; the caller will log traceback as well.
-        print("[_identify_gguf] create_chat_completion raised:", exc)
-        raise
-
-    # Defensive: if resp isn't a dict (some versions/outputs may return other types),
-    # print it and wrap so parsing code below can handle it safely.
-    if not isinstance(resp, dict):
-        print("[_identify_gguf] Non-dict raw response from create_chat_completion:")
-        print(resp)
-        resp = {"choices": [{"message": {"content": str(resp)}}]}
-
-    # Defensive extraction of textual content from various llama-cpp response shapes
-    try:
-        choice0 = resp.get("choices", [{}])[0]
-        message = choice0.get("message", {}) if isinstance(choice0, dict) else {}
-        content = message.get("content", "") if isinstance(message, dict) else ""
-
-        raw_text = ""
-
-        if isinstance(content, str):
-            raw_text = content
-        elif isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    # common multimodal format has {"type":"text","text":"..."}
-                    t = part.get("text") or part.get("content")
-                    if t:
-                        parts.append(str(t))
-                elif isinstance(part, str):
-                    parts.append(part)
-            raw_text = " ".join(parts)
-        elif isinstance(content, dict):
-            raw_text = content.get("text") or content.get("content") or str(content)
-        else:
-            raw_text = str(content)
-
-        raw = raw_text.strip()
+        resp1 = _call_model(messages1, max_tokens=30)
     except Exception:
-        # If parsing fails, print the entire raw response for debugging and re-raise
-        print("[_identify_gguf] Failed to parse response. Raw resp printed below for debugging:")
-        print(resp)
+        # bubble up so identify() logs the traceback
         raise
 
-    # fallback: if empty, try other defensive reads
-    if not raw:
-        try:
-            # some versions place text under choices[0].get('text') or similar
-            raw = str(resp.get("choices", [{}])[0].get("text", "")).strip()
-        except Exception:
-            raw = ""
+    raw1 = _extract_raw(resp1)
+    print("[_identify_gguf] raw resp (strategy1):", repr(raw1))
+    if not _is_control_or_garbage(raw1):
+        return _parse_noun(raw1)
 
-    if not raw:
-        # as a last resort log the whole response and return generic 'object'
-        print("[_identify_gguf] Empty text extracted; full response:")
-        print(resp)
-        return "object"
+    # Strategy 2: explicit fallback — label the blob as a Base64 image block (different parser heuristics)
+    messages2 = [
+        {
+            "role": "user",
+            "content": (
+                f"{_PROMPT}\n"
+                "The image is provided below as base64. Please answer with ONLY one noun (1-3 words).\n\n"
+                "ImageBase64:\n"
+                f"{img_b64}"
+            )
+        }
+    ]
 
-    return _parse_noun(raw)
+    try:
+        resp2 = _call_model(messages2, max_tokens=60)
+    except Exception:
+        raise
+
+    raw2 = _extract_raw(resp2)
+    print("[_identify_gguf] raw resp (strategy2):", repr(raw2))
+    if not _is_control_or_garbage(raw2):
+        return _parse_noun(raw2)
+
+    # Log full responses for diagnosis and return generic fallback
+    print("[_identify_gguf] Both strategies returned empty/control output. Full resp1 / resp2 below:")
+    print(resp1)
+    print(resp2)
+    return "object"
 
 
 def _identify_safetensors(image: Image.Image) -> str:

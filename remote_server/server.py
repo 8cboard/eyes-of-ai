@@ -29,6 +29,7 @@ Quick start:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
@@ -40,10 +41,28 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.gzip import GZipMiddleware
 import uvicorn
 
-app = FastAPI(title="VisionTracker Remote ID Server", version="3.0.0")
+app = FastAPI(title="VisionTracker Remote ID Server", version="3.1.0")
+
+# Limit request body to 10 MB — a 800px JPEG is well under 500 KB,
+# so this guards against accidental giant payloads without being restrictive.
+_MAX_BODY_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_BODY_BYTES:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body too large (max {_MAX_BODY_BYTES // 1024 // 1024} MB)"},
+        )
+    return await call_next(request)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global state
@@ -53,6 +72,9 @@ _model       = None
 _model_type  = None   # 'gguf' | 'safetensors'
 _model_name  = "unknown"
 _MAX_GB      = 10.0
+
+# Executor for running synchronous inference without blocking the event loop
+_executor    = None   # set to ThreadPoolExecutor in main()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,17 +138,7 @@ def load_gguf_model(
     chat_format: Optional[str] = None,
     n_ctx: int = 4096,
 ) -> None:
-    """Load a GGUF vision-language model via llama-cpp-python.
-
-    Parameters
-    ----------
-    model_path  : path to the main .gguf file
-    mmproj_path : path to the vision-encoder (mmproj) .gguf file.
-                  Required for LLaVA-style and Qwen2-VL models.
-                  Without this the model is effectively text-only.
-    chat_format : llama-cpp chat format string (auto-detected if None)
-    n_ctx       : context length
-    """
+    """Load a GGUF vision-language model via llama-cpp-python."""
     global _model, _model_type, _model_name
 
     from llama_cpp import Llama
@@ -156,7 +168,6 @@ def load_gguf_model(
             "         Download the matching mmproj-*.gguf from HuggingFace."
         )
 
-    # Resolve chat format
     resolved_fmt = chat_format or _auto_chat_format(Path(model_path).stem)
     if resolved_fmt:
         kwargs["chat_format"] = resolved_fmt
@@ -186,7 +197,6 @@ def load_safetensors_model(model_path: str) -> None:
 
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
-    # Try model classes in order of preference for VLMs
     model = None
     tried = []
     for cls_name in [
@@ -300,7 +310,6 @@ def _identify_safetensors(image: Image.Image) -> str:
             text=_PROMPT, images=image, return_tensors="pt"
         )
     except TypeError:
-        # Some processors don't accept 'text' as a positional-only kwarg
         inputs = processor(images=image, text=_PROMPT, return_tensors="pt")
 
     if device == "cuda":
@@ -315,24 +324,60 @@ def _identify_safetensors(image: Image.Image) -> str:
         )
 
     raw = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
-    # Remove echoed prompt if present
     if _PROMPT[:20] in raw:
         raw = raw.split(_PROMPT[-20:])[-1].strip()
     return _parse_noun(raw)
 
 
 def _parse_noun(text: str) -> str:
-    """Normalise raw LLM output to a clean 1–3 word noun phrase."""
+    """Normalise raw LLM output to a clean 1–3 word noun phrase.
+
+    Extended to strip more preamble phrases that models commonly produce
+    even when instructed to output the noun only.
+    """
     text = text.strip().lower()
     text = text.strip("\"'`")
     text = text.split("\n")[0].strip()
     text = re.sub(r"[.!?]+$", "", text).strip()
-    # Drop common preamble phrases
-    for prefix in ("it is a ", "it is an ", "this is a ", "this is an ",
-                   "i see a ", "i see an ", "the object is a ", "the object is "):
+
+    # Extended preamble list — order matters (longest/most specific first)
+    _PREAMBLES = (
+        "the object inside the green box is a ",
+        "the object inside the green box is an ",
+        "the object inside the green box is ",
+        "the object in the green box is a ",
+        "the object in the green box is an ",
+        "the object in the green box is ",
+        "the object in the box is a ",
+        "the object in the box is an ",
+        "the object in the box is ",
+        "the object is a ",
+        "the object is an ",
+        "the object is ",
+        "i can see a ",
+        "i can see an ",
+        "i can see ",
+        "i see a ",
+        "i see an ",
+        "i see ",
+        "this is a ",
+        "this is an ",
+        "this is ",
+        "it is a ",
+        "it is an ",
+        "it is ",
+        "that is a ",
+        "that is an ",
+        "that is ",
+        "looks like a ",
+        "looks like an ",
+        "looks like ",
+    )
+    for prefix in _PREAMBLES:
         if text.startswith(prefix):
             text = text[len(prefix):].strip()
             break
+
     text = re.sub(r"[^\w\s\-]", "", text).strip()
     words = text.split()
     if not words or len(words) > 4:
@@ -350,7 +395,7 @@ async def health():
         "status": "healthy" if _model is not None else "no_model",
         "model": _model_name,
         "type": _model_type,
-        "version": "3.0.0",
+        "version": "3.1.0",
     }
 
 
@@ -373,11 +418,17 @@ async def identify(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
 
+    # FIX: VLM inference is synchronous and CPU/GPU-bound.  Running it
+    # directly inside an async def blocks the entire uvicorn event loop,
+    # preventing health-check pings and queue-depth requests from being
+    # served while inference is in progress.  Offloading to the executor
+    # lets the event loop keep ticking during long inference calls.
+    loop = asyncio.get_event_loop()
     try:
         if _model_type == "gguf":
-            result = _identify_gguf(image)
+            result = await loop.run_in_executor(_executor, _identify_gguf, image)
         elif _model_type == "safetensors":
-            result = _identify_safetensors(image)
+            result = await loop.run_in_executor(_executor, _identify_safetensors, image)
         else:
             raise HTTPException(status_code=500, detail="Unknown model type")
     except Exception as exc:
@@ -392,6 +443,7 @@ async def identify(
 
 def main() -> None:
     import argparse
+    from concurrent.futures import ThreadPoolExecutor
 
     p = argparse.ArgumentParser(
         description=(
@@ -428,8 +480,12 @@ def main() -> None:
     if args.api_key:
         os.environ["SERVER_API_KEY"] = args.api_key
 
+    # One worker: VRAM/shared memory can't safely run two inferences in parallel.
+    global _executor
+    _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-worker")
+
     print("=" * 62)
-    print("  VisionTracker Remote LLM Server  v3.0.0")
+    print("  VisionTracker Remote LLM Server  v3.1.0")
     print("=" * 62)
 
     load_model(

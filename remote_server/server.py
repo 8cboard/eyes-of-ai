@@ -136,7 +136,7 @@ def load_gguf_model(
     model_path: str,
     mmproj_path: Optional[str] = None,
     chat_format: Optional[str] = None,
-    n_ctx: int = 4096,
+    n_ctx: int = 32768,
 ) -> None:
     """Load a GGUF vision-language model via llama-cpp-python."""
     global _model, _model_type, _model_name

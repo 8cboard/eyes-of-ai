@@ -477,7 +477,7 @@ async def identify(
     # served while inference is in progress.  Offloading to the executor
     # lets the event loop keep ticking during long inference calls.
     loop = asyncio.get_event_loop()
-        try:
+    try:
         if _model_type == "gguf":
             result = await loop.run_in_executor(_executor, _identify_gguf, image)
         elif _model_type == "safetensors":

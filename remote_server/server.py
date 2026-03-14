@@ -1,31 +1,29 @@
-"""
-remote_server/server.py — VisionTracker Remote LLM Server
-
-FastAPI server for single-object visual identification.
-Supports GGUF (llama-cpp-python) and Safetensors (transformers) VLMs.
-
-Recommended model: Qwen2-VL-7B-Instruct (state-of-the-art, <10 GB)
-  Main GGUF:  bartowski/Qwen2-VL-7B-Instruct-GGUF
-                Qwen2-VL-7B-Instruct-Q4_K_M.gguf  (~4.5 GB)
-  mmproj:     mmproj-Qwen2-VL-7B-Instruct-f16.gguf (~1.0 GB)
-  chat_format: qwen2-vl
-
-Alternative: LLaVA-1.6-Mistral-7B (very stable with llama-cpp)
-  Main GGUF:  cjpais/llava-1.6-mistral-7b-gguf
-                llava-1.6-mistral-7b.Q4_K_M.gguf   (~4.4 GB)
-  mmproj:     mmproj-model-f16.gguf                (~631 MB)
-  chat_format: llava-1-6
-
-Quick start:
-  # Colab / Kaggle — install with CUDA wheels
-  pip install llama-cpp-python \\
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
-
-  # Start server
-  python server.py \\
-    --model-path  /path/to/Qwen2-VL-7B-Instruct-Q4_K_M.gguf \\
-    --mmproj-path /path/to/mmproj-Qwen2-VL-7B-Instruct-f16.gguf
-"""
+# remote_server/server.py — VisionTracker Remote LLM Server
+#
+# FastAPI server for single-object visual identification.
+# Supports GGUF (llama-cpp-python) and Safetensors (transformers) VLMs.
+#
+# Recommended model: Qwen2-VL-7B-Instruct (state-of-the-art, <10 GB)
+#   Main GGUF:  bartowski/Qwen2-VL-7B-Instruct-GGUF
+#                 Qwen2-VL-7B-Instruct-Q4_K_M.gguf  (~4.5 GB)
+#   mmproj:     mmproj-Qwen2-VL-7B-Instruct-f16.gguf (~1.0 GB)
+#   chat_format: qwen2-vl
+#
+# Alternative: LLaVA-1.6-Mistral-7B (very stable with llama-cpp)
+#   Main GGUF:  cjpais/llava-1.6-mistral-7b-gguf
+#                 llava-1.6-mistral-7b.Q4_K_M.gguf   (~4.4 GB)
+#   mmproj:     mmproj-model-f16.gguf                (~631 MB)
+#   chat_format: llava-1-6
+#
+# Quick start:
+#   # Colab / Kaggle — install with CUDA wheels
+#   pip install llama-cpp-python \
+#     --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+#
+#   # Start server
+#   python server.py \
+#     --model-path  /path/to/Qwen2-VL-7B-Instruct-Q4_K_M.gguf \
+#     --mmproj-path /path/to/mmproj-Qwen2-VL-7B-Instruct-f16.gguf
 
 from __future__ import annotations
 
@@ -69,13 +67,13 @@ async def limit_body_size(request: Request, call_next):
 # Global state
 # ─────────────────────────────────────────────────────────────────────────────
 
-_model       = None
-_model_type  = None   # 'gguf' | 'safetensors'
-_model_name  = "unknown"
-_MAX_GB      = 10.0
+_model = None
+_model_type = None  # 'gguf' | 'safetensors'
+_model_name = "unknown"
+_MAX_GB = 10.0
 
 # Executor for running synchronous inference without blocking the event loop
-_executor    = None   # set to ThreadPoolExecutor in main()
+_executor = None  # set to ThreadPoolExecutor in main()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,16 +81,17 @@ _executor    = None   # set to ThreadPoolExecutor in main()
 # ─────────────────────────────────────────────────────────────────────────────
 
 class IdentifyRequest(BaseModel):
-    annotated_image: str   # base64 JPEG — full frame with ONE green box drawn
+    annotated_image: str  # base64 JPEG — full frame with ONE green box drawn
 
 
 class IdentifyResponse(BaseModel):
-    result: str            # single common noun, e.g. "person", "car"
+    result: str  # single common noun, e.g. "person", "car"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _model_size_gb(path: str) -> float:
     p = Path(path)
@@ -130,7 +129,7 @@ def _auto_chat_format(model_stem: str) -> Optional[str]:
         return "chatml"
     if "mistral" in s or "mixtral" in s:
         return "mistral-instruct"
-    return None   # let llama-cpp auto-detect
+    return None  # let llama-cpp auto-detect
 
 
 def load_gguf_model(
@@ -150,7 +149,7 @@ def load_gguf_model(
     kwargs: dict = dict(
         model_path=model_path,
         n_ctx=n_ctx,
-        n_gpu_layers=-1,   # offload all layers to GPU
+        n_gpu_layers=-1,  # offload all layers to GPU
         verbose=False,
     )
 
@@ -176,7 +175,7 @@ def load_gguf_model(
     else:
         print("[Server] chat_format: auto-detect (llama-cpp default)")
 
-    _model      = Llama(**kwargs)
+    _model = Llama(**kwargs)
     _model_type = "gguf"
     _model_name = Path(model_path).stem
     print(f"[Server] ✓ GGUF model loaded: {_model_name}")
@@ -193,7 +192,7 @@ def load_safetensors_model(model_path: str) -> None:
     print(f"[Server] Model size: {_model_size_gb(model_path):.2f} GB")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype  = torch.float16 if device == "cuda" else torch.float32
+    dtype = torch.float16 if device == "cuda" else torch.float32
     print(f"[Server] Device: {device} | dtype: {dtype}")
 
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
@@ -228,7 +227,7 @@ def load_safetensors_model(model_path: str) -> None:
     if device == "cpu":
         model = model.to(device)
 
-    _model      = {"model": model, "processor": processor, "device": device}
+    _model = {"model": model, "processor": processor, "device": device}
     _model_type = "safetensors"
     _model_name = Path(model_path).name
     print(f"[Server] ✓ Safetensors model loaded: {_model_name}")
@@ -284,7 +283,7 @@ def _identify_gguf(image: Image.Image) -> str:
         {
             "role": "user",
             "content": [
-                {"type": "text",      "text": _PROMPT},
+                {"type": "text", "text": _PROMPT},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
             ],
         }
@@ -301,6 +300,13 @@ def _identify_gguf(image: Image.Image) -> str:
         # Bubble up with a clear message; the caller will log traceback as well.
         print("[_identify_gguf] create_chat_completion raised:", exc)
         raise
+
+    # Defensive: if resp isn't a dict (some versions/outputs may return other types),
+    # print it and wrap so parsing code below can handle it safely.
+    if not isinstance(resp, dict):
+        print("[_identify_gguf] Non-dict raw response from create_chat_completion:")
+        print(resp)
+        resp = {"choices": [{"message": {"content": str(resp)}}]}
 
     # Defensive extraction of textual content from various llama-cpp response shapes
     try:
@@ -329,7 +335,7 @@ def _identify_gguf(image: Image.Image) -> str:
             raw_text = str(content)
 
         raw = raw_text.strip()
-    except Exception as exc:
+    except Exception:
         # If parsing fails, print the entire raw response for debugging and re-raise
         print("[_identify_gguf] Failed to parse response. Raw resp printed below for debugging:")
         print(resp)
@@ -354,9 +360,9 @@ def _identify_gguf(image: Image.Image) -> str:
 
 def _identify_safetensors(image: Image.Image) -> str:
     import torch
-    model     = _model["model"]
+    model = _model["model"]
     processor = _model["processor"]
-    device    = _model["device"]
+    device = _model["device"]
 
     try:
         inputs = processor(
@@ -435,7 +441,7 @@ def _parse_noun(text: str) -> str:
     words = text.split()
     if not words or len(words) > 4:
         return "object"
-    return " ".join(words[:3])   # cap at 3 words
+    return " ".join(words[:3])  # cap at 3 words
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -467,7 +473,7 @@ async def identify(
 
     try:
         img_bytes = base64.b64decode(req.annotated_image)
-        image     = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
 
@@ -484,7 +490,7 @@ async def identify(
             result = await loop.run_in_executor(_executor, _identify_safetensors, image)
         else:
             raise HTTPException(status_code=500, detail="Unknown model type")
-    except Exception as exc:
+    except Exception:
         # Print the full traceback from the worker for debugging
         print("[identify] Inference exception traceback:")
         traceback.print_exc()
@@ -518,18 +524,18 @@ def main() -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--model-path",  required=True,
+    p.add_argument("--model-path", required=True,
                    help="Path to .gguf file or safetensors model directory")
     p.add_argument("--mmproj-path", default=None,
                    help="Path to vision-encoder mmproj .gguf file (required for "
                         "LLaVA / Qwen2-VL and most other GGUF VLMs)")
     p.add_argument("--chat-format", default=None,
                    help="llama-cpp chat format override (auto-detected if omitted)")
-    p.add_argument("--host",   default="0.0.0.0")
-    p.add_argument("--port",   type=int, default=8000)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
     p.add_argument("--api-key", default=None,
                    help="Optional bearer token for /identify endpoint")
-    p.add_argument("--n-ctx",  type=int, default=4096,
+    p.add_argument("--n-ctx", type=int, default=4096,
                    help="Context length for GGUF models (default: 4096)")
     args = p.parse_args()
 

@@ -35,6 +35,7 @@ import io
 import os
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -289,13 +290,65 @@ def _identify_gguf(image: Image.Image) -> str:
         }
     ]
 
-    resp = _model.create_chat_completion(
-        messages=messages,
-        max_tokens=30,
-        temperature=0.1,
-        stop=["</s>", "\n", "<|im_end|>", "<|endoftext|>"],
-    )
-    raw = resp["choices"][0]["message"]["content"].strip()
+    try:
+        resp = _model.create_chat_completion(
+            messages=messages,
+            max_tokens=30,
+            temperature=0.1,
+            stop=["</s>", "\n", "<|im_end|>", "<|endoftext|>"],
+        )
+    except Exception as exc:
+        # Bubble up with a clear message; the caller will log traceback as well.
+        print("[_identify_gguf] create_chat_completion raised:", exc)
+        raise
+
+    # Defensive extraction of textual content from various llama-cpp response shapes
+    try:
+        choice0 = resp.get("choices", [{}])[0]
+        message = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+        content = message.get("content", "") if isinstance(message, dict) else ""
+
+        raw_text = ""
+
+        if isinstance(content, str):
+            raw_text = content
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    # common multimodal format has {"type":"text","text":"..."}
+                    t = part.get("text") or part.get("content")
+                    if t:
+                        parts.append(str(t))
+                elif isinstance(part, str):
+                    parts.append(part)
+            raw_text = " ".join(parts)
+        elif isinstance(content, dict):
+            raw_text = content.get("text") or content.get("content") or str(content)
+        else:
+            raw_text = str(content)
+
+        raw = raw_text.strip()
+    except Exception as exc:
+        # If parsing fails, print the entire raw response for debugging and re-raise
+        print("[_identify_gguf] Failed to parse response. Raw resp printed below for debugging:")
+        print(resp)
+        raise
+
+    # fallback: if empty, try other defensive reads
+    if not raw:
+        try:
+            # some versions place text under choices[0].get('text') or similar
+            raw = str(resp.get("choices", [{}])[0].get("text", "")).strip()
+        except Exception:
+            raw = ""
+
+    if not raw:
+        # as a last resort log the whole response and return generic 'object'
+        print("[_identify_gguf] Empty text extracted; full response:")
+        print(resp)
+        return "object"
+
     return _parse_noun(raw)
 
 
@@ -424,7 +477,7 @@ async def identify(
     # served while inference is in progress.  Offloading to the executor
     # lets the event loop keep ticking during long inference calls.
     loop = asyncio.get_event_loop()
-    try:
+        try:
         if _model_type == "gguf":
             result = await loop.run_in_executor(_executor, _identify_gguf, image)
         elif _model_type == "safetensors":
@@ -432,7 +485,10 @@ async def identify(
         else:
             raise HTTPException(status_code=500, detail="Unknown model type")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # Print the full traceback from the worker for debugging
+        print("[identify] Inference exception traceback:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal inference error (see server logs)")
 
     return IdentifyResponse(result=result)
 

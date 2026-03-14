@@ -476,7 +476,7 @@ async def identify(
         image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
-
+    
     # FIX: VLM inference is synchronous and CPU/GPU-bound.  Running it
     # directly inside an async def blocks the entire uvicorn event loop,
     # preventing health-check pings and queue-depth requests from being

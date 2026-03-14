@@ -120,9 +120,9 @@ def _auto_chat_format(model_stem: str) -> Optional[str]:
     if "qwen2-vl" in s or "qwen2vl" in s:
         return "qwen2-vl"
     if "llava-1.6" in s or "llava-1-6" in s or "llava1.6" in s:
-        return "llava-1-6"
+        return "chatml"
     if "llava" in s:
-        return "llava-1-5"
+        return "chatml"
     if "minicpm" in s:
         return "minicpm-v"
     if "phi-3" in s or "phi3" in s:
